@@ -1,0 +1,438 @@
+// ============================================================
+// REDEVABILITÉ 2027 — Schéma de base de données
+// Format : DBML (Database Markup Language)
+// Cible  : PostgreSQL via Supabase
+// ============================================================
+
+
+// ============================================================
+// BLOC 1 — DIMENSIONS POLITIQUES
+// Tables de référence stables, alimentées une seule fois
+// au démarrage puis mises à jour manuellement.
+// ============================================================
+
+Table dim_groupe {
+  // Représente les 11 groupes politiques officiels de la 17e législature.
+  // C'est la table "météo" principale : chaque groupe aura son score affiché.
+  //
+  // CHOIX CLÉ : on stocke le "label_meteo" ici (et non en front-end) pour
+  // que la logique de seuil soit auditée côté base de données et non
+  // cachée dans le code React. Tout le monde peut vérifier le calcul.
+
+  id            serial        [pk, increment]
+  uid_officiel  varchar(20)   [unique, not null, note: "Code officiel AN, ex: 'PO717460' — sert de clé pour les jointures avec les fichiers JSON de l'AN"]
+  sigle         varchar(20)   [unique, not null, note: "Ex: 'RN', 'EPR', 'LFI-NFP', 'SOC'"]
+  nom_complet   varchar(200)  [not null, note: "Ex: 'Rassemblement National'"]
+  couleur_hex   char(7)       [not null, note: "Ex: '#003189' — pour l'UI météo. Stocké en DB pour cohérence entre web et potentiels exports."]
+  nb_sieges     smallint      [not null, note: "Mis à jour manuellement si changement de composition"]
+  actif         boolean       [not null, default: true, note: "false si le groupe est dissous en cours de législature"]
+  created_at    timestamptz   [not null, default: `now()`]
+
+  indexes {
+    sigle [name: "idx_groupe_sigle"]
+  }
+}
+
+Table dim_depute {
+  // Un député par ligne. La jointure avec dim_groupe via groupe_id
+  // permet de calculer la "Météo du Groupe" par agrégation.
+  //
+  // CHOIX CLÉ : on stocke group_id et non le sigle en dur pour garantir
+  // l'intégrité référentielle. Si un groupe change de nom (ex: LREM → RE → EPR),
+  // on met à jour dim_groupe.nom_complet, pas 577 lignes ici.
+  //
+  // CHOIX CLÉ : uid_an est la clé métier primaire. C'est l'identifiant
+  // opaque (ex: "PA719464") présent dans le JSON ventilationVotes de l'AN.
+  // Toutes les jointures avec les données brutes se font sur ce champ.
+
+  id              serial        [pk, increment]
+  uid_an          varchar(20)   [unique, not null, note: "Identifiant technique de l'Assemblée nationale. Ex: 'PA719464'"]
+  nom             varchar(100)  [not null]
+  prenom          varchar(100)  [not null]
+  groupe_id       int           [not null, ref: > dim_groupe.id, note: "Groupe actuel. Voir dim_depute_groupe_historique pour les changements de groupe."]
+  departement     varchar(100)  [not null, note: "Ex: 'Paris', 'Nord'"]
+  num_circo       smallint      [not null, note: "Ex: 3 pour la 3e circonscription"]
+  profession      varchar(200)  [note: "Optionnel, utile pour la fiche 'Mode Expert'"]
+  photo_url       varchar(500)  [note: "URL vers l'image officielle de l'AN ou Wikimedia"]
+  actif           boolean       [not null, default: true, note: "false si démission, décès, nomination au gouvernement"]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    uid_an        [name: "idx_depute_uid_an"]
+    groupe_id     [name: "idx_depute_groupe"]
+    (departement, num_circo) [name: "idx_depute_circo", note: "Recherche géographique pour la personnalisation 'mon député'"]
+  }
+}
+
+Table dim_depute_groupe_historique {
+  // CHOIX CLÉ : table d'audit des changements de groupe.
+  // Indispensable pour la neutralité : un député qui quitte son groupe
+  // en cours de mandat ne doit PAS voir ses votes passés réattribués au
+  // nouveau groupe. Le score de cohérence est calculé à la date du vote,
+  // pas au groupe actuel.
+  // Sans cette table, l'application serait vulnérable à des accusations de
+  // manipulation (ex: un transfuge ferait monter/baisser le score rétroactivement).
+
+  id            serial      [pk, increment]
+  depute_id     int         [not null, ref: > dim_depute.id]
+  groupe_id     int         [not null, ref: > dim_groupe.id]
+  date_debut    date        [not null]
+  date_fin      date        [note: "NULL = groupe actuel"]
+
+  indexes {
+    (depute_id, date_debut) [name: "idx_histo_depute_date"]
+  }
+}
+
+
+// ============================================================
+// BLOC 2 — RÉFÉRENTIEL DES PROMESSES (Ground Truth)
+// Alimenté par le script d'extraction PDF + validation manuelle.
+// Figé ensuite : c'est la vérité de référence inviolable.
+// ============================================================
+
+Table dim_theme {
+  // Taxonomie thématique à plat (pas d'arborescence pour la V1).
+  // CHOIX CLÉ : table dédiée plutôt qu'un ENUM PostgreSQL.
+  // Un ENUM est rigide : ajouter une valeur nécessite ALTER TYPE bloquant.
+  // Une table permet d'ajouter des thèmes sans migration, et d'associer
+  // des métadonnées (icône emoji, couleur) utiles pour l'UI météo.
+
+  id          serial      [pk, increment]
+  slug        varchar(50) [unique, not null, note: "Ex: 'fiscalite', 'immigration', 'ecologie', 'sante', 'pouvoir-achat'"]
+  label       varchar(100) [not null, note: "Ex: 'Fiscalité', 'Immigration', 'Écologie'"]
+  emoji       char(4)     [note: "Ex: '💰', '🌿', '🏥' — pour l'UI onboarding utilisateur"]
+  ordre       smallint    [note: "Ordre d'affichage dans l'onboarding"]
+}
+
+Table dim_promesse {
+  // LE cœur du système. Contient les 100-200 promesses extraites des
+  // programmes officiels par Gemini + validées manuellement.
+  //
+  // CHOIX CLÉ : groupe_id est NOT NULL.
+  // On track des promesses PAR groupe, pas des promesses "universelles".
+  // Ce qui est une promesse pour RN peut être une trahison pour LFI.
+  // L'analyse de polarité (+1/-1) est toujours relative à ce groupe.
+  //
+  // CHOIX CLÉ : source_pdf_page et source_citation permettent au
+  // "Mode Expert" d'afficher exactement quelle ligne du programme est
+  // concernée. Protection anti-manipulation absolue.
+  //
+  // CHOIX CLÉ : statut ENUM plutôt que boolean pour permettre "suspendu"
+  // (ex: une promesse conditionnée à une majorité que le parti n'a pas).
+
+  id                  serial        [pk, increment]
+  groupe_id           int           [not null, ref: > dim_groupe.id]
+  theme_id            int           [not null, ref: > dim_theme.id]
+  intitule_court      varchar(200)  [not null, note: "Ex: 'Retraite à 60 ans pour les carrières longues' — affiché en UI"]
+  description_longue  text          [note: "Résumé étendu pour le Mode Expert"]
+  source_pdf_nom      varchar(200)  [not null, note: "Ex: 'Programme-RN-Legislatives-2024.pdf'"]
+  source_pdf_page     smallint      [not null, note: "Numéro de page dans le PDF source"]
+  source_citation     text          [not null, note: "Extrait textuel brut du programme (max 500 chars). Fourni par Gemini, validé manuellement. C'est la preuve inattaquable."]
+  statut              varchar(20)   [not null, default: 'active',
+                                    note: "ENUM logique: 'active' | 'suspendue' | 'retiree'. Une promesse 'retirée' n'entre plus dans le calcul du score."]
+  created_at          timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (groupe_id, theme_id)  [name: "idx_promesse_groupe_theme"]
+    statut                 [name: "idx_promesse_statut"]
+  }
+}
+
+
+// ============================================================
+// BLOC 3 — FAITS PARLEMENTAIRES
+// Données ingérées quotidiennement depuis l'Open Data AN.
+// Volume le plus important de la base.
+// ============================================================
+
+Table fact_scrutin {
+  // Un scrutin public = une loi/amendement ayant fait l'objet d'un vote
+  // nominatif à l'Assemblée nationale.
+  //
+  // CHOIX CLÉ : uid_an est la clé métier (ex: "VTANR5L17V0842").
+  // Elle correspond au champ uid dans le JSON de l'AN et permet un
+  // UPSERT idempotent dans le pipeline ETL quotidien.
+  //
+  // CHOIX CLÉ : on stocke texte_integral_objet et expose_des_motifs
+  // car c'est exactement ce qu'on envoie au LLM pour classification.
+  // Stocker ces textes évite des appels API répétés si on rejoue le
+  // pipeline (ex: changement de modèle, recalibration du prompt).
+  //
+  // CHOIX CLÉ : sort_adopte (boolean) stocke si le texte a été adopté.
+  // Nécessaire car voter "Pour" un texte rejeté n'a pas le même impact
+  // politique que voter "Pour" un texte adopté. Peut être utilisé pour
+  // pondérer les scores dans une V2.
+
+  id                    serial        [pk, increment]
+  uid_an                varchar(50)   [unique, not null, note: "Ex: 'VTANR5L17V0842'. Clé d'idempotence pour l'ETL."]
+  numero                int           [not null, note: "Numéro du scrutin dans la législature, ex: 842"]
+  legislature           smallint      [not null, default: 17]
+  titre                 varchar(500)  [not null, note: "Titre court du texte (champ 'titre' du JSON AN)"]
+  objet                 text          [not null, note: "Description de l'objet du vote (champ 'objet' du JSON AN). Envoyé au LLM."]
+  expose_des_motifs     text          [note: "L'exposé des motifs est l'entrée principale pour la classification. NULL si absent du JSON."]
+  date_scrutin          date          [not null]
+  sort_adopte           boolean       [not null, note: "true si le texte a été adopté. Issu du champ 'sort' du JSON AN."]
+  url_an                varchar(500)  [note: "Ex: 'https://www.assemblee-nationale.fr/dyn/17/scrutins/842'. Pour le lien 'Mode Expert'."]
+  llm_traite            boolean       [not null, default: false, note: "Flag ETL : ce scrutin a-t-il déjà été envoyé au LLM pour classification ? Évite les doubles appels API."]
+  pertinent             boolean       [note: "NULL = non encore filtré. true = à classifier. false = scrutin procédural écarté par le filtre ETL."]
+  created_at            timestamptz   [not null, default: `now()`]
+
+  indexes {
+    uid_an          [name: "idx_scrutin_uid_an"]
+    date_scrutin    [name: "idx_scrutin_date"]
+    (llm_traite, pertinent) [name: "idx_scrutin_etl_queue", note: "Requête du job ETL : WHERE pertinent = true AND llm_traite = false"]
+  }
+}
+
+Table fact_vote_individuel {
+  // Un enregistrement par couple (député × scrutin).
+  // C'est la table de faits principale : ~577 deputies × ~1000 scrutins
+  // par législature = ~577 000 lignes. Très gérable en 500 MB Supabase.
+  //
+  // CHOIX CLÉ : on utilise une SMALLINT pour position_vote plutôt
+  // qu'un ENUM pour compacité et pour permettre le calcul SQL direct.
+  //   1  = Pour
+  //  -1  = Contre
+  //   0  = Abstention
+  //  NULL = Non-votant / Absent (délégation de vote non comptabilisée)
+  // Ce codage numérique permet d'écrire la formule du score directement
+  // en SQL sans CASE WHEN : SUM(v.position_vote * c.polarite_llm).
+  //
+  // CHOIX CLÉ : on stocke groupe_id_au_moment_du_vote dénormalisé ici.
+  // C'est une violation de la 3NF intentionnelle pour la performance et
+  // la traçabilité. La jointure avec dim_depute_groupe_historique serait
+  // coûteuse à chaque calcul de score. Ce champ est alimenté une fois
+  // à l'insertion et n'est jamais modifié.
+
+  id                          serial      [pk, increment]
+  depute_id                   int         [not null, ref: > dim_depute.id]
+  scrutin_id                  int         [not null, ref: > fact_scrutin.id]
+  groupe_id_au_moment_du_vote int         [not null, ref: > dim_groupe.id, note: "Dénormalisé intentionnellement. Groupe du député AU MOMENT DU VOTE."]
+  position_vote               smallint    [note: "1=Pour, -1=Contre, 0=Abstention, NULL=Absent/Non-votant"]
+
+  indexes {
+    (depute_id, scrutin_id) [unique, name: "uq_vote_depute_scrutin"]
+    (scrutin_id, groupe_id_au_moment_du_vote) [name: "idx_vote_scrutin_groupe", note: "Calcul des scores de groupe par scrutin"]
+    groupe_id_au_moment_du_vote [name: "idx_vote_groupe"]
+  }
+}
+
+
+// ============================================================
+// BLOC 4 — CLASSIFICATION LLM
+// Sortie du pipeline Gemini. Pont entre les scrutins et les promesses.
+// ============================================================
+
+Table llm_classification {
+  // Résultat de l'appel à l'API Gemini Flash pour chaque scrutin pertinent.
+  // C'est ici que la "magie" de l'IA est capturée et rendue auditables.
+  //
+  // CHOIX CLÉ : un scrutin peut mapper sur PLUSIEURS promesses
+  // (ex: une loi sur les retraites peut toucher à la fois la promesse
+  // "âge de départ" ET la promesse "pénibilité"). D'où la relation
+  // N:M entre fact_scrutin et dim_promesse via cette table.
+  //
+  // CHOIX CLÉ : polarite_llm SMALLINT (-1 ou 1), jamais NULL après
+  // traitement. Si le LLM ne peut pas déterminer la polarité, il ne
+  // crée pas de ligne (le scrutin reste llm_traite=false pour relance).
+  //
+  // CHOIX CLÉ : confidence_score (0.0 à 1.0) est demandé au LLM dans
+  // le JSON Schema. Les classifications avec confidence < 0.6 sont
+  // marquées en "review" et n'entrent pas dans le calcul du score
+  // jusqu'à validation manuelle. Protection anti-hallucination.
+  //
+  // CHOIX CLÉ : on stocke le prompt_hash (SHA-256 des instructions système).
+  // Si on change le prompt ou qu'on monte de version de modèle, on peut
+  // rejouer UNIQUEMENT les classifications avec l'ancien hash. Auditabilité totale.
+  //
+  // CHOIX CLÉ : la colonne raisonnement_llm stocke le champ "reasoning"
+  // que Gemini peut produire avant sa réponse JSON. Précieux pour débugger
+  // les classifications surprenantes sans rappeler l'API.
+
+  id                  serial        [pk, increment]
+  scrutin_id          int           [not null, ref: > fact_scrutin.id]
+  promesse_id         int           [not null, ref: > dim_promesse.id]
+  polarite_llm        smallint      [not null, note: "1 = ce vote, s'il est POUR, va dans le sens de la promesse. -1 = va à l'encontre."]
+  confidence_score    numeric(3,2)  [not null, note: "0.00 à 1.00. Fourni par le LLM dans sa réponse JSON structurée."]
+  statut_validation   varchar(20)   [not null, default: 'auto',
+                                    note: "ENUM logique côté IA : 'auto' (confiance >= 0.7), 'review' (confiance < 0.7, en attente), 'valide' (IA jugée correcte manuellement), 'rejete' (faux positif écarté). Concerne la QUALITÉ de la classification."]
+
+  // ---- Colonne ajoutée suite au retour CTO ----
+  // CHOIX CLÉ : statut_publication est SÉPARÉ de statut_validation.
+  // Ce sont deux préoccupations orthogonales :
+  //   statut_validation = "est-ce que l'IA s'est bien classifié ?"
+  //   statut_publication = "est-ce que TOI tu autorises l'affichage ?"
+  // Un enregistrement peut être statut_validation='valide' (IA fiable)
+  // mais statut_publication='brouillon' (tu n'as pas encore relu).
+  // Le calcul du score et l'UI publique ne lisent QUE statut_publication='publie'.
+  // C'est le verrou du workflow Human-in-the-Loop.
+  statut_publication  varchar(20)   [not null, default: 'brouillon',
+                                    note: "ENUM logique côté éditorial : 'brouillon' (en attente de validation humaine), 'publie' (approuvé, entre dans le calcul du score). Modifié via l'interface /admin."]
+
+  modele_llm          varchar(50)   [not null, note: "Ex: 'gemini-2.5-flash-lite'. Versioning pour audit."]
+  prompt_hash         char(64)      [not null, note: "SHA-256 du system prompt utilisé. Permet de retracer quelle version du prompt a produit ce résultat."]
+  raisonnement_llm    text          [note: "Chain-of-thought optionnel retourné par le modèle. Utile pour debug."]
+  created_at          timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (scrutin_id, promesse_id) [unique, name: "uq_classification_scrutin_promesse", note: "Un seul mapping par couple. En cas de reclassification, UPDATE et non INSERT."]
+    (statut_publication, statut_validation) [name: "idx_classif_statut", note: "Requête du calcul de score: WHERE statut_publication = 'publie'. Index composite pour le filtre admin: WHERE statut_publication = 'brouillon'."]
+    confidence_score          [name: "idx_classif_confidence"]
+  }
+}
+
+
+// ============================================================
+// BLOC 5 — SCORES (Couche de présentation pré-calculée)
+// Vue matérialisée ou table de cache rafraîchie après chaque ETL.
+// L'UI React lit UNIQUEMENT depuis cette table. Jamais de calcul
+// à la volée depuis le front-end.
+// ============================================================
+
+Table cache_score_groupe {
+  // Table de cache des scores agrégés par groupe et par thème.
+  // Rafraîchie par une fonction PostgreSQL appelée en fin de pipeline ETL.
+  //
+  // CHOIX CLÉ : table plutôt que VIEW MATÉRIALISÉE pour deux raisons :
+  // 1. Une VUE MAT. sur Supabase Free ne peut pas être rafraîchie
+  //    depuis pg_cron sans REFRESH CONCURRENTLY (qui exige un index UNIQUE).
+  // 2. Une table permet de stocker des métadonnées comme computed_at
+  //    et de faire du delta partiel (UPDATE WHERE groupe_id = X).
+  //
+  // CHOIX CLÉ : on stocke le score sur une plage 0-100 (pas 0-1) pour
+  // l'affichage. Et on stocke séparément le score_brut (somme algébrique
+  // non normalisée) pour les journalistes qui veulent "refaire le calcul".
+  //
+  // CHOIX CLÉ : theme_id peut être NULL → score global toutes thématiques.
+  // C'est l'icône météo principale de l'app. Les scores par thème permettent
+  // la personnalisation selon les intérêts de l'utilisateur.
+
+  id              serial        [pk, increment]
+  groupe_id       int           [not null, ref: > dim_groupe.id]
+  theme_id        int           [ref: > dim_theme.id, note: "NULL = score global multi-thématique"]
+  score_0_100     smallint      [not null, note: "Score normalisé 0-100. Seuils météo: 0-30=Orage, 31-60=Nuage, 61-80=Éclaircies, 81-100=Soleil."]
+  score_brut      numeric(7,4)  [not null, note: "Valeur réelle de la formule Σ(vote × polarité) / N. Téléchargeable pour vérification indépendante."]
+  nb_scrutins     int           [not null, note: "Dénominateur du score = nombre de scrutins pris en compte."]
+  label_meteo     varchar(20)   [not null, note: "ENUM logique: 'soleil' | 'eclaircies' | 'nuage' | 'orage'. Dérivé de score_0_100, stocké pour perf."]
+  computed_at     timestamptz   [not null, default: `now()`, note: "Timestamp du dernier recalcul. Affiché en footer de l'UI pour transparence."]
+
+  indexes {
+    (groupe_id, theme_id) [unique, name: "uq_score_groupe_theme"]
+    groupe_id             [name: "idx_score_groupe"]
+  }
+}
+
+Table cache_score_depute {
+  // Score individuel par député, utilisé pour la vue "mon représentant local"
+  // (personnalisation géographique). Même logique que cache_score_groupe.
+  //
+  // CHOIX CLÉ : on maintient les deux niveaux de cache (groupe + député)
+  // même si l'UI principale n'affiche que les groupes. Le score député
+  // permet : (a) la personnalisation géographique, (b) de détecter les
+  // "rebelles" (députés dont le score diverge fortement de leur groupe).
+  // Cette divergence est elle-même une donnée neutre et factuelle
+  // potentiellement virale ("Untel vote à 45% contre son propre parti").
+
+  id              serial        [pk, increment]
+  depute_id       int           [not null, ref: > dim_depute.id]
+  theme_id        int           [ref: > dim_theme.id, note: "NULL = score global"]
+  score_0_100     smallint      [not null]
+  score_brut      numeric(7,4)  [not null]
+  nb_scrutins     int           [not null]
+  delta_vs_groupe smallint      [note: "Différence score député - score groupe. Ex: +15 = député plus cohérent que son groupe. NULL si < 5 scrutins (pas statistiquement fiable)."]
+  computed_at     timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (depute_id, theme_id) [unique, name: "uq_score_depute_theme"]
+    depute_id             [name: "idx_score_depute"]
+    delta_vs_groupe       [name: "idx_score_delta", note: "Pour requêter les 'rebelles' tri par ABS(delta_vs_groupe) DESC"]
+  }
+}
+
+
+// ============================================================
+// BLOC 6 — UTILISATEURS & PERSONNALISATION
+// Minimal pour la V1. Ne stocke que les préférences thématiques
+// et la circonscription. Pas de tracking comportemental.
+// ============================================================
+
+Table user_preferences {
+  // Lié à auth.users de Supabase via user_id (UUID).
+  // CHOIX CLÉ : on ne crée PAS de table users custom : Supabase Auth
+  // gère déjà email, password, OAuth. Cette table n'étend que les
+  // préférences métier nécessaires à la personnalisation.
+  //
+  // CHOIX CLÉ : themes_favoris est un tableau d'IDs plutôt qu'une
+  // table de jonction user_theme pour éviter une jointure supplémentaire
+  // à chaque chargement de dashboard. Une préférence personnelle n'est
+  // pas une donnée relationnelle critique. Le tableau PostgreSQL INT[]
+  // est parfaitement adapté.
+  //
+  // CHOIX CLÉ : on stocke departement + num_circo et non un FK vers
+  // dim_depute. L'utilisateur pourrait changer de circonscription ou
+  // le député changer. On résout le député au moment de la requête.
+
+  user_id         uuid          [pk, note: "FK vers auth.users(id) de Supabase. Type UUID natif."]
+  departement     varchar(100)  [note: "Ex: 'Bas-Rhin'. NULL si l'utilisateur n'a pas renseigné sa circo."]
+  num_circo       smallint      [note: "Ex: 2 pour la 2e circonscription du Bas-Rhin."]
+  themes_favoris  int[]         [note: "Array d'IDs de dim_theme. Ex: ARRAY[1, 3, 5]. Utilisé pour pondérer l'affichage du dashboard."]
+  created_at      timestamptz   [not null, default: `now()`]
+  updated_at      timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (departement, num_circo) [name: "idx_pref_circo"]
+  }
+}
+
+Table user_alertes {
+  // Permettre à un utilisateur de s'abonner aux notifications
+  // quand UN groupe précis vote sur UN thème précis.
+  // Feature optionnelle V1, mais le schéma est posé dès maintenant.
+  //
+  // CHOIX CLÉ : table dédiée et non un JSONB dans user_preferences.
+  // Les alertes sont des entités avec un cycle de vie (créées, déclenchées,
+  // désactivées). Un JSONB rendrait ce cycle de vie ingérable.
+
+  id          serial      [pk, increment]
+  user_id     uuid        [not null, note: "FK logique vers auth.users(id). Pas de FK physique pour éviter les complications avec le schema auth."]
+  groupe_id   int         [not null, ref: > dim_groupe.id]
+  theme_id    int         [ref: > dim_theme.id, note: "NULL = alertes sur toutes thématiques pour ce groupe"]
+  actif       boolean     [not null, default: true]
+  created_at  timestamptz [not null, default: `now()`]
+
+  indexes {
+    (user_id, groupe_id, theme_id) [unique, name: "uq_alerte_user_groupe_theme"]
+  }
+}
+
+
+// ============================================================
+// BLOC 7 — AUDIT ETL
+// Logs opérationnels du pipeline. Indispensable pour débugger
+// les incidents silencieux (ex: l'AN change son format JSON).
+// ============================================================
+
+Table etl_run_log {
+  // Chaque exécution du CRON job nocturne laisse une trace.
+  // CHOIX CLÉ : table de logs dans la même DB plutôt qu'un service
+  // externe. Zéro coût, consultable directement via le Dashboard Supabase,
+  // et la rotation peut être faite par un pg_cron "DELETE WHERE created_at < now() - interval '90 days'".
+
+  id                  serial        [pk, increment]
+  run_type            varchar(50)   [not null, note: "Ex: 'daily_etl', 'llm_classification', 'score_refresh', 'depute_sync'"]
+  statut              varchar(20)   [not null, note: "ENUM: 'running' | 'success' | 'partial' | 'error'"]
+  nb_scrutins_nouveaux int          [note: "Scrutins nouveaux détectés lors de ce run"]
+  nb_classes          int           [note: "Scrutins envoyés au LLM et classifiés"]
+  nb_erreurs          int           [default: 0]
+  detail_erreur       text          [note: "Stack trace ou message d'erreur si statut = 'error'. NULL sinon."]
+  duree_ms            int           [note: "Durée d'exécution en millisecondes. Utile pour détecter les dégradations de perf."]
+  cout_llm_usd        numeric(8,6)  [note: "Coût de l'appel API Gemini pour ce run. Calculé à partir des tokens consommés retournés par l'API."]
+  created_at          timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (run_type, created_at) [name: "idx_etl_log_type_date"]
+    statut                 [name: "idx_etl_log_statut"]
+  }
+}

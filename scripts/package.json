@@ -1,0 +1,21 @@
+{
+    "name": "redevabilite-2027-scripts",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Scripts d'ingestion du socle de vérité pour Redevabilité 2027",
+    "scripts": {
+        "seed:themes": "tsx 00-seed-themes.ts",
+        "fetch:deputes": "tsx 01-fetch-deputes.ts",
+        "extract:promesses": "tsx 02-extract-promesses.ts"
+    },
+    "dependencies": {
+        "@google/generative-ai": "^0.21.0",
+        "@supabase/supabase-js": "^2.46.0",
+        "dotenv": "^16.4.5"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.6.0"
+    }
+}
