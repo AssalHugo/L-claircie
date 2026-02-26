@@ -28,7 +28,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+import { GoogleGenerativeAI, SchemaType, Schema } from "@google/generative-ai";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
@@ -149,7 +149,17 @@ RÈGLES STRICTES :
    - source_pdf_page doit être le numéro de page où tu as trouvé la citation
    - En cas de doute entre deux pages, indique la page où commence la promesse
 
-IMPORTANT : Tu dois traiter l'intégralité du document, de la page 1 à la dernière page.`;
+7. RÉFÉRENCES TEMPORELLES :
+   - Remplace TOUJOURS les expressions relatives par des années absolues
+     dans intitule_court et description_longue.
+   - "dès cet été" → "dès l'été [ANNEE_DOCUMENT]"
+   - "d'ici la fin de l'année" → "d'ici fin [ANNEE_DOCUMENT]"
+   - "dans les 100 premiers jours" → laisser tel quel (relatif à une prise de pouvoir)
+   - Si tu ne peux pas déterminer l'année avec certitude → omets la référence temporelle
+     plutôt que de laisser une expression ambiguë.
+
+
+  IMPORTANT: Tu dois traiter l'intégralité du document, de la page 1 à la dernière page.`;
 }
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -170,7 +180,7 @@ async function extractPromessesFromPDF(
   pdfPath: string,
   groupeSigle: string,
   nomComplet: string,
-  schema: any,
+  schema: Schema,
   themesSlugList: string[]
 ): Promise<PromesseExtraite[]> {
   const stats = fs.statSync(pdfPath);
@@ -282,7 +292,7 @@ async function insertPromesses(
     source_pdf_nom: sourcePdfNom,
     source_pdf_page: p.source_pdf_page,
     source_citation: p.source_citation.substring(0, 500),
-    statut: "active",
+    statut: null,
   }));
 
   // Pas de clé de conflit unique naturelle sur dim_promesse.
