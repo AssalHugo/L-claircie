@@ -248,7 +248,7 @@ async function main(): Promise<void> {
   console.log(`   Nombre d'appels API : ~${nbBatches}\n`);
 
   // ── Traitement par batches ──
-  const toutesEvaluations: EvaluationGemini[] = [];
+  const allReviewItems: EvaluationGemini[] = [];
   let nbAuto = 0;
   let nbReview = 0;
 
@@ -269,71 +269,67 @@ async function main(): Promise<void> {
       else batchReview++;
     });
 
-    process.stdout.write(` ${elapsed}s → ✅ ${batchAuto} auto, ⚠️  ${batchReview} à relire\n`);
+    // ── Sauvegarde BDD immédiate pour ce batch ──
+    if (!DRY_RUN) {
+      const autoIds = evaluations.filter(e => computeStatut(e) === "auto").map(e => e.id);
+      const batchReviewItems = evaluations.filter(e => computeStatut(e) === "review");
 
-    toutesEvaluations.push(...evaluations);
-    nbAuto += batchAuto;
-    nbReview += batchReview;
+      allReviewItems.push(...batchReviewItems);
 
-    // Pause entre batches pour respecter les rate limits Gemini Free
-    if (i + BATCH_SIZE < promesses.length) {
-      await new Promise(r => setTimeout(r, 1500));
-    }
-  }
+      if (autoIds.length > 0) {
+        const { error: eAuto } = await supabase
+          .from("dim_promesse")
+          .update({ statut: "auto" })
+          .in("id", autoIds);
+        if (eAuto) console.error("\n  ❌ Erreur update auto:", eAuto.message);
+      }
 
-  // ── Mise à jour en base ──
-  if (DRY_RUN) {
-    console.log("\n⚠️  DRY RUN : aucune mise à jour effectuée en base.");
-  } else {
-    console.log("\n💾 Mise à jour de dim_promesse...");
-
-    // Construit les updates par statut pour minimiser les requêtes
-    const autoIds = toutesEvaluations.filter(e => computeStatut(e) === "auto").map(e => e.id);
-    const reviewItems = toutesEvaluations.filter(e => computeStatut(e) === "review");
-
-    // Valide en masse les promesses sans problème
-    if (autoIds.length > 0) {
-      const { error: eAuto } = await supabase
-        .from("dim_promesse")
-        .update({ statut: "auto" })
-        .in("id", autoIds);
-      if (eAuto) console.error("  ❌ Erreur update auto:", eAuto.message);
-      else console.log(`  ✅ ${autoIds.length} promesses → statut = 'auto'`);
-    }
-
-    // Pour les promesses à relire, on stocke aussi la remarque dans un champ dédié.
-    // On fait les updates une par une pour ne pas perdre les remarques individuelles.
-    // (en pratique < 100 requêtes, largement dans les limites Supabase free)
-    if (reviewItems.length > 0) {
-      let nbUpdated = 0;
-      for (const e of reviewItems) {
+      for (const e of batchReviewItems) {
         const { error: eReview } = await supabase
           .from("dim_promesse")
           .update({
             statut: "review",
-            // On stocke le diagnostic dans description_longue si tu n'as pas
-            // de colonne dédiée — à adapter selon ton schéma.
-            // Si tu as une colonne "notes_review", utilise-la ici à la place.
+            statut_raison: e.remarque,
           })
           .eq("id", e.id);
-        if (!eReview) nbUpdated++;
+        if (eReview) console.error(`\n  ❌ Erreur update review [${e.id}]:`, eReview.message);
       }
+    } else {
+      allReviewItems.push(...evaluations.filter(e => computeStatut(e) === "review"));
+    }
 
-      // Affiche les problèmes détectés pour information
-      console.log(`\n  📝 ${reviewItems.length} promesses → statut = 'review'`);
-      console.log("  Détail des problèmes :");
-      reviewItems.slice(0, 20).forEach(e => {
-        const flags = [
-          !e.ok_neutralite ? "biais" : "",
-          !e.ok_concordance ? "concordance" : "",
-          !e.ok_concretude ? "vague" : "",
-          !e.ok_temporel ? "temporel" : "",
-        ].filter(Boolean).join(", ");
-        console.log(`    [${e.id}] ${flags}${e.remarque ? " — " + e.remarque : ""}`);
-      });
-      if (reviewItems.length > 20) {
-        console.log(`    ... et ${reviewItems.length - 20} autres (voir Supabase)`);
-      }
+    process.stdout.write(` ${elapsed}s → ✅ ${batchAuto} auto, ⚠️  ${batchReview} à relire${DRY_RUN ? '' : ' (sauvegardé)'}\n`);
+
+    nbAuto += batchAuto;
+    nbReview += batchReview;
+
+    // Pause entre batches pour respecter les rate limits Gemini Free (augmenté à 4s pour éviter les erreurs 429)
+    if (i + BATCH_SIZE < promesses.length) {
+      await new Promise(r => setTimeout(r, 4000));
+    }
+  }
+
+  // ── Affichage des remarques à la fin ──
+  if (DRY_RUN) {
+    console.log("\n⚠️  DRY RUN : aucune mise à jour effectuée en base.");
+  } else {
+    console.log("\n✅ Toutes les promesses ont été traitées et sauvegardées.");
+  }
+
+  if (allReviewItems.length > 0) {
+    console.log(`\n  📝 ${allReviewItems.length} promesses → statut = 'review'`);
+    console.log("  Détail des problèmes :");
+    allReviewItems.slice(0, 20).forEach(e => {
+      const flags = [
+        !e.ok_neutralite ? "biais" : "",
+        !e.ok_concordance ? "concordance" : "",
+        !e.ok_concretude ? "vague" : "",
+        !e.ok_temporel ? "temporel" : "",
+      ].filter(Boolean).join(", ");
+      console.log(`    [${e.id}] ${flags}${e.remarque ? " — " + e.remarque : ""}`);
+    });
+    if (allReviewItems.length > 20) {
+      console.log(`    ... et ${allReviewItems.length - 20} autres (voir Supabase)`);
     }
   }
 

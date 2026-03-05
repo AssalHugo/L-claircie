@@ -130,13 +130,16 @@ Table dim_promesse {
   source_pdf_nom      varchar(200)  [not null, note: "Ex: 'Programme-RN-Legislatives-2024.pdf'"]
   source_pdf_page     smallint      [not null, note: "Numéro de page dans le PDF source"]
   source_citation     text          [not null, note: "Extrait textuel brut du programme (max 500 chars). Fourni par Gemini, validé manuellement. C'est la preuve inattaquable."]
+  dedupe_hash         char(64)      [unique, not null, note: "SHA-256 de groupe_id || source_citation. Clé de dédoublonnage pour upsert idempotent lors des relances du script d'extraction."]
   statut              varchar(20)   [not null, default: 'active',
                                     note: "ENUM logique: 'active' | 'suspendue' | 'retiree'. Une promesse 'retirée' n'entre plus dans le calcul du score."]
+  statut_raison       text          [note: "Explication du statut ou remarques de relecture"]
   created_at          timestamptz   [not null, default: `now()`]
 
   indexes {
     (groupe_id, theme_id)  [name: "idx_promesse_groupe_theme"]
     statut                 [name: "idx_promesse_statut"]
+    dedupe_hash            [unique, name: "uq_promesse_dedupe"]
   }
 }
 

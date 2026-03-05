@@ -50,6 +50,7 @@ CREATE TABLE "dim_promesse" (
   "source_pdf_page" smallint NOT NULL,
   "source_citation" text NOT NULL,
   "statut" varchar(20) NOT NULL DEFAULT 'active',
+  "statut_raison" text,
   "created_at" timestamptz NOT NULL DEFAULT (now())
 );
 
@@ -241,6 +242,8 @@ COMMENT ON COLUMN "dim_promesse"."source_pdf_page" IS 'Numéro de page dans le P
 COMMENT ON COLUMN "dim_promesse"."source_citation" IS 'Extrait textuel brut du programme (max 500 chars). Fourni par Gemini, validé manuellement. C''est la preuve inattaquable.';
 
 COMMENT ON COLUMN "dim_promesse"."statut" IS 'ENUM logique: ''active'' | ''suspendue'' | ''retiree''. Une promesse ''retirée'' n''entre plus dans le calcul du score.';
+
+COMMENT ON COLUMN "dim_promesse"."statut_raison" IS 'Explication du statut ou remarques de relecture';
 
 COMMENT ON COLUMN "fact_scrutin"."uid_an" IS 'Ex: ''VTANR5L17V0842''. Clé d''idempotence pour l''ETL.';
 

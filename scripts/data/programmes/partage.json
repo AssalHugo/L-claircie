@@ -1,0 +1,28 @@
+[
+  {
+    "pdfs": [
+      "nfp/Programme-nouveaufrontpopulaire.txt",
+      "nfp/proposition-macroeconomique-nouveau-front-populaire.txt"
+    ],
+    "groupes": [
+      "LFI-NFP",
+      "SOC",
+      "ECOS",
+      "GDR"
+    ],
+    "annee": 2024,
+    "description": "Programme commun du Nouveau Front Populaire — législatives juin 2024"
+  },
+  {
+    "pdfs": [
+      "ensemble/programme-legislatives-24.txt"
+    ],
+    "groupes": [
+      "EPR",
+      "HOR",
+      "DEM"
+    ],
+    "annee": 2024,
+    "description": "Programme Ensemble pour la République (Renaissance + MoDem + Horizons)"
+  }
+]
