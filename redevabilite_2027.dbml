@@ -129,6 +129,7 @@ Table dim_promesse {
   description_longue  text          [note: "Résumé étendu pour le Mode Expert"]
   source_pdf_nom      varchar(200)  [not null, note: "Ex: 'Programme-RN-Legislatives-2024.pdf'"]
   source_pdf_page     smallint      [not null, note: "Numéro de page dans le PDF source"]
+  source_pdf_annee    smallint      [note: "Année du document source, ex: 2024. Déduite du nom de fichier ou de partage.json."]
   source_citation     text          [not null, note: "Extrait textuel brut du programme (max 500 chars). Fourni par Gemini, validé manuellement. C'est la preuve inattaquable."]
   dedupe_hash         char(64)      [unique, not null, note: "SHA-256 de groupe_id || source_citation. Clé de dédoublonnage pour upsert idempotent lors des relances du script d'extraction."]
   statut              varchar(20)   [not null, default: 'active',
