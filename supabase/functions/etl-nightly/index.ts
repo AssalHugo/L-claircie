@@ -11,6 +11,10 @@
  *   5. Insère llm_classification avec statut_publication = 'brouillon'
  *   6. Log dans etl_run_log
  *
+ * La logique pure (types AN, normalisation, construction des lignes, validation
+ * des sorties LLM) vit dans ./lib.ts pour être testable hors ligne — voir
+ * `npx tsx scripts/04-verify-etl-mapping.ts`.
+ *
  * Paramètres POST body (optionnels) :
  *   { "dry_run": true }   → simule sans écrire en base
  *   { "max_scrutins": 5 } → limite le nombre de scrutins traités (pour les tests)
@@ -19,91 +23,24 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { GoogleGenerativeAI, SchemaType } from "https://esm.sh/@google/generative-ai@0.21.0";
 
-// ─── Types ─────────────────────────────────────────────────────────────────
+import {
+  buildClassificationRows,
+  buildScrutinRow,
+  buildScrutinText,
+  extractVoteRows,
+  sha256Hex,
+  validateClassifications,
+  type DeputeRef,
+  type GeminiClassifResponse,
+  type Promesse,
+  type ScrutinAN,
+  type ScrutinFile,
+} from "./lib.ts";
 
-interface Votant {
-  acteurRef: string;  // ex: "PA795778" = uid_an dans dim_depute
-  mandatRef?: string;
-  parDelegation?: string;
-}
-
-interface DecompteNominatif {
-  pours?: { votant: Votant | Votant[] } | null;
-  contres?: { votant: Votant | Votant[] } | null;
-  abstentions?: { votant: Votant | Votant[] } | null;
-  nonVotants?: { votant: Votant | Votant[] } | null;
-}
-
-interface GroupeVote {
-  organeRef: string;
-  nombreMembresGroupe?: string | number;
-  vote: {
-    positionMajoritaire?: string;
-    decompteVoix?: {
-      pour?: number | string;
-      contre?: number | string;
-      abstentions?: number | string;
-      nonVotants?: number | string;
-    };
-    decompteNominatif?: DecompteNominatif;
-  };
-}
-
-interface ScrutinAN {
-  uid: string;   // ex: "VTANR5L17V0842"
-  dateScrutin: string;   // ISO date "YYYY-MM-DD"
-  titre?: string;   // Titre du vote
-  legislature?: string;
-  sort?: {
-    code?: string;    // "adopté" | "rejeté"
-    libelle?: string;
-  };
-  syntheseVote?: {
-    nombreVotants?: number | string;
-    suffragesExprimes?: number | string;
-    decompte?: {
-      pour?: number | string;
-      contre?: number | string;
-      abstentions?: number | string;
-    };
-  };
-  // Structure réelle AN : ventilationVotes.organe.groupes.groupe[]
-  ventilationVotes?: {
-    organe?: {
-      organeRef?: string;
-      groupes?: {
-        groupe: GroupeVote | GroupeVote[];
-      };
-    };
-  };
-}
-
-interface ScrutinFile {
-  scrutin: ScrutinAN;
-}
-
-interface Promesse {
-  id: number;
-  intitule_court: string;
-  source_citation: string;
-  groupe_id: number;
-  theme_id: number;
-}
-
-interface ClassificationResult {
-  promesse_id: number;
-  polarite_llm: 1 | -1 | null;
-  confidence_score: number;
-  raisonnement_llm: string;
-}
-
-interface GeminiClassifResponse {
-  classifications: {
-    promesse_id: number;
-    polarite: number;  // 1, -1, ou 0 (non lié)
-    confidence: number;  // 0.0 à 1.0
-    raisonnement: string;
-  }[];
+/** Forme minimale d'un retour PostgREST, suffisante pour la pagination générique. */
+interface QueryResult {
+  data: unknown;
+  error: { message: string } | null;
 }
 
 // ─── Configuration ─────────────────────────────────────────────────────────
@@ -111,21 +48,30 @@ interface GeminiClassifResponse {
 const AN_VOTES_ZIP_URL =
   "https://data.assemblee-nationale.fr/static/openData/repository/17/loi/scrutins/Scrutins.json.zip";
 
-// Nombre max de jours en arrière pour chercher des scrutins
 // Jours en arrière pour la recherche de nouveaux scrutins.
 // Mettre 365 pour le premier run afin de récupérer tout l'historique de la législature.
 // Remettre à 7 ensuite pour les runs nocturnes quotidiens.
 const LOOKBACK_DAYS = parseInt(Deno.env.get("LOOKBACK_DAYS") ?? "7", 10);
 
-// Seuil de confiance en dessous duquel on passe statut = 'review'
+// Seuil de confiance en dessous duquel on passe statut_validation = 'review'.
+// ⚠️ La confiance auto-déclarée par un LLM est mal calibrée : ce seuil n'est
+//    qu'un filet grossier, remplacé par l'accord inter-modèles au Sprint 4.
 const CONFIDENCE_THRESHOLD = 0.7;
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// Modèle de classification — centralisé pour être tracé dans llm_classification.modele_llm.
+// ⚠️ gemini-2.5-flash-lite est arrêté par Google le 16 octobre 2026.
+//    Migration prévue (Sprint 8) vers gemini-3.6-flash + gemini-3.5-flash-lite en double passe.
+const MODEL_CLASSIFICATION = "gemini-2.5-flash-lite";
 
-function toArray<T>(val: T | T[] | null | undefined): T[] {
-  if (!val) return [];
-  return Array.isArray(val) ? val : [val];
-}
+// Tarifs $/1M tokens du modèle ci-dessus. À mettre à jour en même temps que le modèle.
+const PRICE_INPUT_PER_M = 0.10;
+const PRICE_OUTPUT_PER_M = 0.40;
+
+// Taille de page PostgREST. Supabase plafonne silencieusement les SELECT à 1000 lignes :
+// toute lecture non paginée tronque les données sans lever d'erreur.
+const PAGE_SIZE = 1000;
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
 function getSince(): string {
   const d = new Date();
@@ -133,8 +79,26 @@ function getSince(): string {
   return d.toISOString().split("T")[0]; // YYYY-MM-DD
 }
 
+/**
+ * Lit l'intégralité d'une table en paginant par `range()`.
+ * Indispensable : sans cela PostgREST s'arrête à 1000 lignes sans erreur ni avertissement.
+ */
+async function fetchAllPaginated<T>(
+  runPage: (from: number, to: number) => PromiseLike<QueryResult>,
+  label: string,
+): Promise<T[]> {
+  const rows: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await runPage(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`${label}: ${error.message}`);
+    const page = (data ?? []) as T[];
+    rows.push(...page);
+    if (page.length < PAGE_SIZE) break;
+  }
+  return rows;
+}
+
 // ─── Helpers lecture Little-Endian (Deno natif, sans Buffer Node.js) ─────────
-// Deno ne connaît pas Buffer — on lit les octets directement dans Uint8Array.
 
 function readUInt32LE(buf: Uint8Array, offset: number): number {
   return buf[offset] | (buf[offset + 1] << 8) | (buf[offset + 2] << 16) | (buf[offset + 3] << 24);
@@ -186,14 +150,11 @@ async function parseZip(buf: Uint8Array): Promise<{ name: string; text: string }
       try {
         let data: Uint8Array;
         if (method === 0) {
-          // Stocké sans compression
-          data = compressed;
+          data = compressed;              // Stocké sans compression
         } else if (method === 8) {
-          // DEFLATE
-          data = await inflateRaw(compressed);
+          data = await inflateRaw(compressed);  // DEFLATE
         } else {
-          // Méthode inconnue — ignoré
-          i = dataStart + compSize;
+          i = dataStart + compSize;       // Méthode inconnue — ignoré
           continue;
         }
         files.push({ name, text: decoder.decode(data) });
@@ -260,14 +221,32 @@ Deno.serve(async (req: Request) => {
   );
   const genAI = new GoogleGenerativeAI(Deno.env.get("GEMINI_API_KEY")!);
 
-  const logEntry = {
-    statut: "running" as "running" | "success" | "error",
-    dry_run: dryRun,
-    scrutins_traites: 0,
-    scrutins_inseres: 0,
-    classifications_inserees: 0,
-    cout_llm_usd: 0,
-    erreur: null as string | null,
+  // Compteurs internes du run. Le mapping vers les colonnes réelles de
+  // etl_run_log est fait au moment de l'insertion (writeLog).
+  const stats = {
+    scrutinsTraites: 0,
+    scrutinsInseres: 0,
+    classificationsInserees: 0,
+    erreurs: 0,
+    coutLlmUsd: 0,
+  };
+  const messagesErreur: string[] = [];
+
+  /** Écrit dans etl_run_log en respectant EXACTEMENT les colonnes du schéma. */
+  const writeLog = async (statut: "success" | "partial" | "error", detail: string | null) => {
+    if (dryRun) return;
+    const { error } = await supabase.from("etl_run_log").insert({
+      run_type: "daily_etl",
+      statut,
+      nb_scrutins_nouveaux: stats.scrutinsTraites,
+      nb_classes: stats.classificationsInserees,
+      nb_erreurs: stats.erreurs,
+      detail_erreur: detail,
+      duree_ms: Date.now() - startTime,
+      cout_llm_usd: Math.round(stats.coutLlmUsd * 1_000_000) / 1_000_000,
+    });
+    // Si même le log échoue, on veut le voir dans les logs de la Edge Function.
+    if (error) console.error(`[ETL] ⚠️ Échec écriture etl_run_log: ${error.message}`);
   };
 
   try {
@@ -292,34 +271,56 @@ Deno.serve(async (req: Request) => {
     // ════════════════════════════════════════════════════════
     const since = getSince();
 
-    // Récupère les uid_an déjà en base pour la déduplication
-    const { data: existingUids } = await supabase
-      .from("fact_scrutin")
-      .select("uid_an");
-    const knownUids = new Set((existingUids ?? []).map((r: { uid_an: string }) => r.uid_an));
+    // Récupère les uid_an déjà en base pour la déduplication.
+    // Pagination obligatoire : au-delà de 1000 scrutins, une lecture simple
+    // renverrait une liste tronquée et on tenterait de réinsérer des doublons.
+    const existingUids = await fetchAllPaginated<{ uid_an: string }>(
+      (from, to) => supabase
+        .from("fact_scrutin")
+        .select("uid_an")
+        .order("id", { ascending: true })
+        .range(from, to),
+      "Lecture fact_scrutin",
+    );
+    const knownUids = new Set(existingUids.map((r) => r.uid_an));
+    console.log(`[ETL] ${knownUids.size} scrutins déjà en base`);
 
     // Parse et filtre les scrutins
-    const nouveauxScrutins: ScrutinAN[] = [];
+    const candidats: ScrutinAN[] = [];
     for (const file of files) {
       try {
         const parsed = JSON.parse(file.text) as ScrutinFile;
         const s = parsed.scrutin;
         if (!s?.uid) continue;
-        if (knownUids.has(s.uid)) continue;                  // déjà en base
+        if (knownUids.has(s.uid)) continue;                   // déjà en base
         if (s.dateScrutin < since) continue;                  // trop ancien
-        nouveauxScrutins.push(s);
-        if (nouveauxScrutins.length >= maxScrutins) break;
+        candidats.push(s);
       } catch { /* JSON corrompu, ignoré */ }
     }
 
-    console.log(`[ETL] ${nouveauxScrutins.length} nouveaux scrutins à traiter`);
-    logEntry.scrutins_traites = nouveauxScrutins.length;
+    // Tri chronologique AVANT d'appliquer le plafond.
+    // Les fichiers du ZIP sont ordonnés alphabétiquement (V1, V10, V100, V1000…) :
+    // sans ce tri, max_scrutins découpait un sous-ensemble arbitraire du corpus.
+    candidats.sort((a, b) => a.dateScrutin.localeCompare(b.dateScrutin));
+    const nouveauxScrutins = candidats.slice(0, maxScrutins);
+
+    console.log(
+      `[ETL] ${candidats.length} nouveaux scrutins détectés, ${nouveauxScrutins.length} traités ce run`,
+    );
+    if (candidats.length > nouveauxScrutins.length) {
+      console.warn(
+        `[ETL] ⚠️ ${candidats.length - nouveauxScrutins.length} scrutins reportés au prochain run ` +
+        `(plafond max_scrutins=${maxScrutins}). Ils ne seront repris que tant qu'ils restent dans ` +
+        `la fenêtre LOOKBACK_DAYS=${LOOKBACK_DAYS} — file d'attente persistante prévue au Sprint 2.`,
+      );
+    }
+    stats.scrutinsTraites = nouveauxScrutins.length;
 
     if (nouveauxScrutins.length === 0) {
-      logEntry.statut = "success";
-      if (!dryRun) await supabase.from("etl_run_log").insert(logEntry);
+      console.log("[ETL] ✅ Aucun nouveau scrutin");
+      await writeLog("success", null);
       return new Response(
-        JSON.stringify({ status: "ok", message: "Aucun nouveau scrutin", ...logEntry }),
+        JSON.stringify({ status: "ok", message: "Aucun nouveau scrutin", ...stats }),
         { headers: { "Content-Type": "application/json" } }
       );
     }
@@ -327,45 +328,60 @@ Deno.serve(async (req: Request) => {
     // ════════════════════════════════════════════════════════
     // ÉTAPE 3 : Charger les promesses actives publiées
     // ════════════════════════════════════════════════════════
-    const { data: promesses, error: pErr } = await supabase
-      .from("dim_promesse")
-      .select("id, intitule_court, source_citation, groupe_id, theme_id")
-      .in("statut", ["auto", "valide", "active"]); // seulement les promesses validées
+    const promesses = await fetchAllPaginated<Promesse>(
+      (from, to) => supabase
+        .from("dim_promesse")
+        .select("id, intitule_court, source_citation, groupe_id, theme_id")
+        .in("statut", ["auto", "valide", "active"])   // seulement les promesses validées
+        .order("id", { ascending: true })
+        .range(from, to),
+      "Chargement promesses",
+    );
 
-    if (pErr) throw new Error(`Chargement promesses: ${pErr.message}`);
-    if (!promesses?.length) {
+    if (promesses.length === 0) {
       throw new Error("Aucune promesse active validée en base — lance d'abord 03-review-promesses.ts");
     }
-
     console.log(`[ETL] ${promesses.length} promesses actives chargées`);
 
+    // Ensemble des IDs réellement envoyés au modèle : sert à rejeter les
+    // promesse_id hallucinés avant l'INSERT (sinon violation de clé étrangère).
+    const validPromesseIds = new Set(promesses.map((p) => p.id));
+
     // Charger le mapping uid_an → id pour les députés
-    const { data: deputes } = await supabase
-      .from("dim_depute")
-      .select("id, uid_an, groupe_id");
-    const deputeByUidAN = new Map(
-      (deputes ?? []).map((d: { id: number; uid_an: string; groupe_id: number }) =>
-        [d.uid_an, d]
-      )
+    const deputes = await fetchAllPaginated<DeputeRef>(
+      (from, to) => supabase
+        .from("dim_depute")
+        .select("id, uid_an, groupe_id")
+        .order("id", { ascending: true })
+        .range(from, to),
+      "Chargement députés",
     );
+    const deputeByUidAN = new Map(deputes.map((d) => [d.uid_an, d]));
+    console.log(`[ETL] ${deputeByUidAN.size} députés chargés`);
 
     // ════════════════════════════════════════════════════════
     // ÉTAPE 4 : Créer le Context Cache Gemini
     //
     // Le Context Cache permet d'envoyer les promesses UNE SEULE FOIS
     // et de les réutiliser pour tous les scrutins de la nuit.
-    // Économie : ~90% des tokens input pour les appels répétés.
     // ════════════════════════════════════════════════════════
     console.log("[ETL] Création du Context Cache Gemini...");
 
-    // Format compact pour minimiser les tokens
-    const promessesContext = promesses.map((p: Promesse) =>
+    const promessesContext = promesses.map((p) =>
       `[ID:${p.id}] ${p.intitule_court} | Citation: "${p.source_citation.substring(0, 100)}"`
     ).join("\n");
 
-    // Note : le Context Cache de Gemini nécessite l'API REST directe
-    // car le SDK JS ne le supporte pas encore pleinement.
-    // On utilise un cache TTL de 2h (largement suffisant pour le run nocturne).
+    const systemPrompt = `Tu es un expert en droit parlementaire français.
+Voici la liste complète des promesses électorales à évaluer (${promesses.length} promesses) :
+
+${promessesContext}
+
+Pour chaque scrutin que je vais te soumettre, tu devras évaluer le lien entre ce vote et CHACUNE des promesses.`;
+
+    // Hash SHA-256 réel du couple (modèle, prompt système) : permet de rejouer
+    // uniquement les classifications produites par une version donnée du prompt.
+    const promptHash = await sha256Hex(`${MODEL_CLASSIFICATION}||${systemPrompt}`);
+
     const cacheRes = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/cachedContents`,
       {
@@ -375,19 +391,9 @@ Deno.serve(async (req: Request) => {
           "x-goog-api-key": Deno.env.get("GEMINI_API_KEY")!,
         },
         body: JSON.stringify({
-          model: "models/gemini-2.5-flash-lite",
+          model: `models/${MODEL_CLASSIFICATION}`,
           displayName: `promesses-eclaircie-${new Date().toISOString().split("T")[0]}`,
-          contents: [{
-            role: "user",
-            parts: [{
-              text: `Tu es un expert en droit parlementaire français. 
-Voici la liste complète des promesses électorales à évaluer (${promesses.length} promesses) :
-
-${promessesContext}
-
-Pour chaque scrutin que je vais te soumettre, tu devras évaluer le lien entre ce vote et CHACUNE des promesses.`
-            }]
-          }],
+          contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
           ttl: "7200s", // 2 heures
         }),
       }
@@ -399,233 +405,209 @@ Pour chaque scrutin que je vais te soumettre, tu devras évaluer le lien entre c
       cacheName = cacheData.name;
       console.log(`[ETL] Context Cache créé : ${cacheName}`);
     } else {
-      // Le cache a échoué (ex: trop peu de tokens) — on continue sans cache
       const errText = await cacheRes.text();
       console.warn(`[ETL] Context Cache indisponible (${cacheRes.status}): ${errText}`);
       console.warn("[ETL] → Passage en mode sans cache (plus coûteux)");
     }
 
+    /**
+     * Appelle Gemini pour un scrutin, avec ou sans Context Cache.
+     * Renvoie null si l'appel échoue — le scrutin reste alors llm_traite = false
+     * pour être rejoué au prochain run.
+     */
+    const classifyScrutin = async (scrutinText: string): Promise<{
+      response: GeminiClassifResponse;
+      inputTokens: number;
+      outputTokens: number;
+    } | null> => {
+      const consigne =
+        `Analyse ce scrutin et évalue son lien avec CHAQUE promesse de la liste.\n` +
+        `N'inclus dans ta réponse que les promesses avec polarite != 0 (lien détecté).\n\n${scrutinText}`;
+
+      if (cacheName) {
+        const apiResponse = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_CLASSIFICATION}:generateContent`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": Deno.env.get("GEMINI_API_KEY")!,
+            },
+            body: JSON.stringify({
+              cachedContent: cacheName,
+              contents: [{ role: "user", parts: [{ text: consigne }] }],
+              generationConfig: {
+                responseMimeType: "application/json",
+                responseSchema: CLASSIF_SCHEMA,
+                temperature: 0,
+              },
+            }),
+          }
+        );
+
+        if (!apiResponse.ok) {
+          console.error(`[ETL] Gemini error ${apiResponse.status}: ${await apiResponse.text()}`);
+          return null;
+        }
+        const data = await apiResponse.json() as {
+          usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+          candidates?: { content: { parts: { text: string }[] } }[];
+        };
+        return {
+          response: JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}") as GeminiClassifResponse,
+          inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
+          outputTokens: data.usageMetadata?.candidatesTokenCount ?? 0,
+        };
+      }
+
+      // Fallback sans cache : les promesses sont envoyées à chaque requête
+      const model = genAI.getGenerativeModel({
+        model: MODEL_CLASSIFICATION,
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: CLASSIF_SCHEMA as Parameters<typeof genAI.getGenerativeModel>[0]["generationConfig"],
+          temperature: 0,
+        },
+        systemInstruction: systemPrompt,
+      });
+      const result = await model.generateContent(consigne);
+      const usage = result.response.usageMetadata;
+      return {
+        response: JSON.parse(result.response.text()) as GeminiClassifResponse,
+        inputTokens: usage?.promptTokenCount ?? 0,
+        outputTokens: usage?.candidatesTokenCount ?? 0,
+      };
+    };
+
     // ════════════════════════════════════════════════════════
     // ÉTAPE 5 : Traiter chaque scrutin
     // ════════════════════════════════════════════════════════
-    let totalCost = 0;
-    let totalClassifs = 0;
-
     for (const scrutin of nouveauxScrutins) {
-      console.log(`[ETL] Scrutin ${scrutin.uid} — ${scrutin.titre?.substring(0, 60)}...`);
+      const libelle = (scrutin.objet?.libelle ?? scrutin.titre ?? "").substring(0, 60);
+      console.log(`[ETL] Scrutin ${scrutin.uid} — ${libelle}...`);
 
       // ── 5a : Insérer dans fact_scrutin ──
-      let scrutinDbId: number | null = null;
+      let scrutinDbId = -1; // -1 = ID fictif pour le dry run
 
       if (!dryRun) {
         const { data: scrutinInserted, error: sErr } = await supabase
           .from("fact_scrutin")
-          .insert({
-            uid_an: scrutin.uid,
-            date_scrutin: scrutin.dateScrutin,
-            objet: scrutin.titre ?? "Sans objet",
-            expose_des_motifs: "", // Rempli par une version V2 si besoin
-            llm_traite: false,
-            pertinent: false, // Mis à jour après classification
-          })
+          .insert(buildScrutinRow(scrutin))
           .select("id")
           .single();
 
         if (sErr) {
-          console.error(`[ETL] Erreur insertion scrutin ${scrutin.uid}: ${sErr.message}`);
+          console.error(`[ETL] ❌ Erreur insertion scrutin ${scrutin.uid}: ${sErr.message}`);
+          stats.erreurs++;
+          messagesErreur.push(`insert fact_scrutin ${scrutin.uid}: ${sErr.message}`);
           continue;
         }
         scrutinDbId = scrutinInserted.id;
-        logEntry.scrutins_inseres++;
-      } else {
-        scrutinDbId = -1; // ID fictif pour le dry run
+        stats.scrutinsInseres++;
       }
 
       // ── 5b : Insérer les votes individuels ──
-      if (!dryRun && scrutinDbId && scrutinDbId > 0) {
-        const votesRows: {
-          scrutin_id: number;
-          depute_id: number;
-          groupe_id_au_moment_du_vote: number;
-          position_vote: 1 | -1 | 0 | null;
-        }[] = [];
-
-        // Structure réelle AN :
-        // ventilationVotes.organe.groupes.groupe[] (un par groupe politique)
-        // Chaque groupe a vote.decompteNominatif.{pours,contres,abstentions,nonVotants}
-        // Chaque votant est { acteurRef: "PA...", mandatRef, parDelegation }
-        const groupes = toArray(
-          scrutin.ventilationVotes?.organe?.groupes?.groupe
-        ) as GroupeVote[];
-
-        // Extrait les acteurRef depuis un decompteNominatif entry
-        const extractActeurRefs = (
-          entry: { votant: Votant | Votant[] } | null | undefined
-        ): string[] => {
-          if (!entry || !entry.votant) return [];
-          return toArray(entry.votant).map((v) => v.acteurRef).filter(Boolean);
-        };
-
-        for (const groupe of groupes) {
-          const nomi = groupe.vote?.decompteNominatif;
-          if (!nomi) continue;
-
-          const buildVotes = (acteurRefs: string[], pos: 1 | -1 | 0 | null) =>
-            acteurRefs.map(acteurRef => {
-              const dep = deputeByUidAN.get(acteurRef);
-              if (!dep) return null;
-              return {
-                scrutin_id: scrutinDbId!,
-                depute_id: dep.id,
-                groupe_id_au_moment_du_vote: dep.groupe_id,
-                position_vote: pos,
-              };
-            }).filter(Boolean) as typeof votesRows;
-
-          votesRows.push(
-            ...buildVotes(extractActeurRefs(nomi.pours), 1),
-            ...buildVotes(extractActeurRefs(nomi.contres), -1),
-            ...buildVotes(extractActeurRefs(nomi.abstentions), 0),
-            ...buildVotes(extractActeurRefs(nomi.nonVotants), null),
-          );
-        }
+      if (!dryRun && scrutinDbId > 0) {
+        const votesRows = extractVoteRows(scrutin, scrutinDbId, deputeByUidAN);
 
         if (votesRows.length > 0) {
-          // Insertion par batch de 100
+          // Insertion par batch de 100 — les erreurs étaient jusqu'ici ignorées.
+          let votesInseres = 0;
           for (let i = 0; i < votesRows.length; i += 100) {
-            await supabase
+            const lot = votesRows.slice(i, i + 100);
+            const { error: vErr } = await supabase
               .from("fact_vote_individuel")
-              .insert(votesRows.slice(i, i + 100));
+              .insert(lot);
+            if (vErr) {
+              console.error(`[ETL] ❌ Erreur insertion votes ${scrutin.uid}: ${vErr.message}`);
+              stats.erreurs++;
+              messagesErreur.push(`insert votes ${scrutin.uid}: ${vErr.message}`);
+            } else {
+              votesInseres += lot.length;
+            }
           }
-          console.log(`[ETL]   → ${votesRows.length} votes individuels insérés`);
+          console.log(`[ETL]   → ${votesInseres}/${votesRows.length} votes individuels insérés`);
         }
       }
 
       // ── 5c : Classification Gemini ──
-      const scrutinText = `
-SCRUTIN : ${scrutin.uid}
-DATE : ${scrutin.dateScrutin}
-OBJET : ${scrutin.titre}
-RÉSULTAT : ${scrutin.syntheseVote?.libelle ?? "inconnu"} (${scrutin.syntheseVote?.nbreSuffragesPour ?? 0} pour, ${scrutin.syntheseVote?.nbreSuffragesContre ?? 0} contre)
-`;
-
-      let classifResponse: GeminiClassifResponse | null = null;
-      let inputTokens = 0, outputTokens = 0;
-
+      let classifResult: Awaited<ReturnType<typeof classifyScrutin>> = null;
       try {
-        let apiResponse: Response;
-
-        if (cacheName) {
-          // Appel avec Context Cache via REST API
-          apiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-goog-api-key": Deno.env.get("GEMINI_API_KEY")!,
-              },
-              body: JSON.stringify({
-                cachedContent: cacheName,
-                contents: [{
-                  role: "user",
-                  parts: [{
-                    text: `Analyse ce scrutin et évalue son lien avec CHAQUE promesse de la liste mise en cache.
-N'inclus dans ta réponse que les promesses avec polarite != 0 (lien détecté).
-
-${scrutinText}`
-                  }]
-                }],
-                generationConfig: {
-                  responseMimeType: "application/json",
-                  responseSchema: CLASSIF_SCHEMA,
-                  temperature: 0,
-                },
-              }),
-            }
-          );
-        } else {
-          // Fallback sans cache : on envoie les promesses dans chaque requête
-          const model = genAI.getGenerativeModel({
-            model: "gemini-2.5-flash-lite",
-            generationConfig: {
-              responseMimeType: "application/json",
-              responseSchema: CLASSIF_SCHEMA as Parameters<typeof genAI.getGenerativeModel>[0]["generationConfig"],
-              temperature: 0,
-            },
-          });
-          const result = await model.generateContent(
-            `Voici les promesses :\n${promessesContext}\n\nAnalyse ce scrutin :\n${scrutinText}\n\nN'inclus que les promesses avec polarite != 0.`
-          );
-          const usage = result.response.usageMetadata;
-          inputTokens = usage?.promptTokenCount ?? 0;
-          outputTokens = usage?.candidatesTokenCount ?? 0;
-          classifResponse = JSON.parse(result.response.text()) as GeminiClassifResponse;
-          apiResponse = null as unknown as Response; // déjà traité
-        }
-
-        if (apiResponse !== null) {
-          if (!apiResponse.ok) {
-            console.error(`[ETL] Gemini error: ${apiResponse.status}`);
-          } else {
-            const data = await apiResponse.json() as {
-              usageMetadata?: { promptTokenCount: number; candidatesTokenCount: number };
-              candidates?: { content: { parts: { text: string }[] } }[];
-            };
-            inputTokens = data.usageMetadata?.promptTokenCount ?? 0;
-            outputTokens = data.usageMetadata?.candidatesTokenCount ?? 0;
-            const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
-            classifResponse = JSON.parse(text) as GeminiClassifResponse;
-          }
-        }
-
-        // Coût Gemini 2.5 Flash-Lite : $0.10/1M input, $0.40/1M output
-        const cost = (inputTokens * 0.10 + outputTokens * 0.40) / 1_000_000;
-        totalCost += cost;
-
+        classifResult = await classifyScrutin(buildScrutinText(scrutin));
       } catch (geminiErr) {
-        console.error(`[ETL] Gemini erreur scrutin ${scrutin.uid}:`, geminiErr);
+        const msg = geminiErr instanceof Error ? geminiErr.message : String(geminiErr);
+        console.error(`[ETL] ❌ Gemini erreur scrutin ${scrutin.uid}: ${msg}`);
+        stats.erreurs++;
+        messagesErreur.push(`gemini ${scrutin.uid}: ${msg}`);
       }
 
-      // ── 5d : Insérer les classifications ──
-      if (classifResponse?.classifications?.length && scrutinDbId) {
-        const liensTrouves = classifResponse.classifications.filter(c => c.polarite !== 0);
-        console.log(`[ETL]   → ${liensTrouves.length} liens promesse-scrutin détectés`);
+      // Appel raté : on laisse llm_traite = false pour que le scrutin soit rejouable.
+      if (!classifResult) continue;
 
-        if (!dryRun && liensTrouves.length > 0) {
-          // Hash du prompt pour traçabilité (version simple)
-          const promptHash = btoa(`gemini-2.5-flash-lite-v1-${new Date().toISOString().split("T")[0]}`).substring(0, 32);
+      stats.coutLlmUsd +=
+        (classifResult.inputTokens * PRICE_INPUT_PER_M +
+          classifResult.outputTokens * PRICE_OUTPUT_PER_M) / 1_000_000;
 
-          const classifRows = liensTrouves.map(c => ({
-            scrutin_id: scrutinDbId!,
-            promesse_id: c.promesse_id,
-            polarite_llm: c.polarite as 1 | -1,
-            confidence_score: c.confidence,
-            raisonnement_llm: c.raisonnement,
-            prompt_hash: promptHash,
-            statut: c.confidence >= CONFIDENCE_THRESHOLD ? "auto" : "review",
-            statut_publication: "brouillon",
-          }));
+      // ── 5d : Valider puis insérer les classifications ──
+      const validation = validateClassifications(
+        classifResult.response.classifications,
+        validPromesseIds,
+      );
 
-          const { error: cErr } = await supabase
-            .from("llm_classification")
-            .insert(classifRows);
+      if (validation.rejetesInconnus > 0) {
+        console.warn(`[ETL]   ⚠️ ${validation.rejetesInconnus} promesse_id inconnus rejetés (hallucination LLM)`);
+      }
+      if (validation.rejetesDoublons > 0) {
+        console.warn(`[ETL]   ⚠️ ${validation.rejetesDoublons} promesse_id en doublon rejetés`);
+      }
+      console.log(`[ETL]   → ${validation.retenus.length} liens promesse-scrutin retenus`);
 
-          if (cErr) {
-            console.error(`[ETL] Erreur insertion classifications: ${cErr.message}`);
-          } else {
-            totalClassifs += classifRows.length;
+      if (dryRun || scrutinDbId <= 0) continue;
 
-            // Marquer le scrutin comme traité
-            await supabase
-              .from("fact_scrutin")
-              .update({
-                llm_traite: true,
-                pertinent: liensTrouves.length > 0,
-              })
-              .eq("id", scrutinDbId);
+      if (validation.retenus.length > 0) {
+        const classifRows = buildClassificationRows(
+          validation.retenus,
+          scrutinDbId,
+          MODEL_CLASSIFICATION,
+          promptHash,
+          CONFIDENCE_THRESHOLD,
+        );
+
+        // Upsert groupé, puis repli ligne par ligne pour isoler une éventuelle
+        // ligne fautive au lieu de perdre toutes les classifications du scrutin.
+        const { error: cErr } = await supabase
+          .from("llm_classification")
+          .upsert(classifRows, { onConflict: "scrutin_id,promesse_id" });
+
+        if (!cErr) {
+          stats.classificationsInserees += classifRows.length;
+        } else {
+          console.warn(`[ETL]   ⚠️ Upsert groupé échoué (${cErr.message}) — repli ligne par ligne`);
+          for (const row of classifRows) {
+            const { error: rowErr } = await supabase
+              .from("llm_classification")
+              .upsert(row, { onConflict: "scrutin_id,promesse_id" });
+            if (rowErr) {
+              console.error(`[ETL]   ❌ promesse ${row.promesse_id}: ${rowErr.message}`);
+              stats.erreurs++;
+              messagesErreur.push(`classif ${scrutin.uid}/${row.promesse_id}: ${rowErr.message}`);
+            } else {
+              stats.classificationsInserees++;
+            }
           }
         }
+      }
+
+      // Le scrutin a été soumis au LLM avec succès : on le marque traité même
+      // si aucun lien n'a été trouvé, sinon il serait rejoué indéfiniment.
+      const { error: uErr } = await supabase
+        .from("fact_scrutin")
+        .update({ llm_traite: true, pertinent: validation.retenus.length > 0 })
+        .eq("id", scrutinDbId);
+      if (uErr) {
+        console.error(`[ETL] ❌ Erreur update llm_traite ${scrutin.uid}: ${uErr.message}`);
+        stats.erreurs++;
+        messagesErreur.push(`update fact_scrutin ${scrutin.uid}: ${uErr.message}`);
       }
     }
 
@@ -641,37 +623,53 @@ ${scrutinText}`
     }
 
     // ════════════════════════════════════════════════════════
-    // ÉTAPE 6 : Log final
+    // ÉTAPE 6 : Bilan — échouer bruyamment plutôt que silencieusement
     // ════════════════════════════════════════════════════════
-    logEntry.statut = "success";
-    logEntry.classifications_inserees = totalClassifs;
-    logEntry.cout_llm_usd = Math.round(totalCost * 10000) / 10000;
-
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[ETL] ✅ Terminé en ${elapsed}s — ${logEntry.scrutins_inseres} scrutins, ${totalClassifs} classifications, $${logEntry.cout_llm_usd}`);
+    stats.coutLlmUsd = Math.round(stats.coutLlmUsd * 1_000_000) / 1_000_000;
 
-    if (!dryRun) {
-      await supabase.from("etl_run_log").insert(logEntry);
+    // Cas critique : des scrutins étaient à traiter mais AUCUN n'a été inséré.
+    // C'est exactement le mode de défaillance qui a rendu l'ETL muet jusqu'ici.
+    if (!dryRun && stats.scrutinsTraites > 0 && stats.scrutinsInseres === 0) {
+      const detail =
+        `Aucun scrutin inséré alors que ${stats.scrutinsTraites} étaient à traiter. ` +
+        `Premières erreurs: ${messagesErreur.slice(0, 3).join(" | ") || "aucune remontée"}`;
+      console.error(`[ETL] 💥 ${detail}`);
+      await writeLog("error", detail);
+      return new Response(
+        JSON.stringify({ status: "error", message: detail, elapsed_s: elapsed, ...stats }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
     }
 
+    const statut = stats.erreurs > 0 ? "partial" : "success";
+    const detail = stats.erreurs > 0 ? messagesErreur.slice(0, 10).join(" | ") : null;
+
+    console.log(
+      `[ETL] ${statut === "success" ? "✅" : "⚠️"} Terminé en ${elapsed}s — ` +
+      `${stats.scrutinsInseres} scrutins, ${stats.classificationsInserees} classifications, ` +
+      `${stats.erreurs} erreurs, $${stats.coutLlmUsd}`
+    );
+
+    await writeLog(statut, detail);
+
     return new Response(
-      JSON.stringify({ status: "ok", elapsed_s: elapsed, ...logEntry }),
-      { headers: { "Content-Type": "application/json" } }
+      JSON.stringify({ status: statut, elapsed_s: elapsed, ...stats }),
+      {
+        status: statut === "partial" ? 207 : 200,
+        headers: { "Content-Type": "application/json" },
+      }
     );
 
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[ETL] 💥 Erreur fatale:", message);
 
-    logEntry.statut = "error";
-    logEntry.erreur = message;
-
-    if (!dryRun) {
-      await supabase.from("etl_run_log").insert(logEntry);
-    }
+    stats.erreurs++;
+    await writeLog("error", message);
 
     return new Response(
-      JSON.stringify({ status: "error", message, ...logEntry }),
+      JSON.stringify({ status: "error", message, ...stats }),
       { status: 500, headers: { "Content-Type": "application/json" } }
     );
   }

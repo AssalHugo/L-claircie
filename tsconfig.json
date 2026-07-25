@@ -11,6 +11,10 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
+    // Les scripts de vérification importent la logique pure de l'Edge Function
+    // (supabase/functions/etl-nightly/lib.ts), qui doit garder l'extension .ts
+    // explicite pour rester importable par Deno. Sans effet à l'émission (noEmit).
+    "allowImportingTsExtensions": true,
     "jsx": "react-jsx",
     "incremental": true,
     "plugins": [
@@ -30,5 +34,9 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules"]
+  // supabase/functions/etl-nightly/index.ts tourne sous Deno (globale `Deno`,
+  // imports HTTP esm.sh) : il ne peut pas être typé par la config Next.
+  // Il se vérifie avec `deno check supabase/functions/etl-nightly/index.ts`.
+  // lib.ts reste couvert, car importé par scripts/04-verify-etl-mapping.ts.
+  "exclude": ["node_modules", "supabase/functions"]
 }

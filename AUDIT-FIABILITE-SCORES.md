@@ -1,0 +1,517 @@
+# 🔍 Audit de fiabilité des scores — L'Éclaircie
+
+> Audit réalisé le 25 juillet 2026 sur la branche `main` (commit `250b4aa`).
+> Méthode : lecture intégrale du pipeline (`scripts/`, `supabase/functions/etl-nightly`, `src/`, `civic_tech.sql`)
+> **+ téléchargement et analyse statistique du corpus réel** `Scrutins.json.zip` de la 17e législature
+> (8 434 scrutins, 1,27 M de votes individuels) pour quantifier chaque problème.
+
+---
+
+## 0. Verdict en une page
+
+Le score n'est pas « imprécis » : **il n'existe pas encore, et la chaîne qui doit l'alimenter est cassée à trois endroits bloquants**. Au-delà des bugs, la méthodologie actuelle produirait, même corrigée, un score non défendable publiquement — pour une raison mesurée sur les données réelles : **86 % des scrutins de l'Assemblée sont des votes d'amendements dont le libellé ne contient aucune information sémantique exploitable**.
+
+| # | Constat | Gravité | Preuve |
+|---|---|---|---|
+| **P0-1** | L'insertion dans `fact_scrutin` viole 3 contraintes `NOT NULL` → aucun scrutin n'est jamais inséré | 🔴 Bloquant | `etl-nightly/index.ts:423` vs `civic_tech.sql:57` |
+| **P0-2** | L'insertion dans `llm_classification` écrit une colonne inexistante (`statut`) et omet `modele_llm` (`NOT NULL`) | 🔴 Bloquant | `etl-nightly/index.ts:599` vs `civic_tech.sql:81` |
+| **P0-3** | Aucune fonction de calcul de score n'existe (ni SQL, ni TS). `cache_score_groupe` / `cache_score_depute` ne sont jamais alimentées | 🔴 Bloquant | `grep cache_score src/` → 0 résultat |
+| **P1-1** | 86 % des scrutins ont un libellé sans contenu sémantique → classification LLM impossible sur ce sous-corpus | 🟠 Fiabilité | 7 221/8 434 mesurés |
+| **P1-2** | Participation médiane **26 %** (135 votants/577) → score député construit sur un échantillon minuscule et auto-sélectionné | 🟠 Fiabilité | mesuré sur 8 434 scrutins |
+| **P1-3** | Les `SELECT` Supabase sont plafonnés silencieusement à 1 000 lignes → promesses et scrutins connus tronqués | 🟠 Fiabilité | `etl-nightly/index.ts:296,330` |
+| **P1-4** | Les promesses partagées (NFP × 4 groupes, Ensemble × 3 groupes) sont dupliquées en lignes distinctes → le même texte reçoit des polarités potentiellement différentes | 🟠 Fiabilité | `partage.json` + `02-extract:415` |
+| **P1-5** | `groupe_id_au_moment_du_vote` est renseigné avec le groupe **actuel** — l'inverse de l'intention documentée | 🟠 Neutralité | `etl-nightly/index.ts:480` |
+| **P2-x** | Formule de score non spécifiée : absences, abstentions, motions de censure, pondération, taille d'échantillon | 🟡 Méthodo | voir §4 |
+
+**La bonne nouvelle** : le corpus contient **1 213 scrutins sémantiquement exploitables** (dont 72 solennels avec **92 % de participation**). C'est exactement le périmètre décrit dans la spec produit d'origine (« Top 50 des textes polémiques ») et jamais implémenté. En s'y restreignant, le score devient à la fois calculable, fiable et 7× moins cher.
+
+---
+
+## 1. Ce que disent les données réelles
+
+Analyse du fichier officiel `17/loi/scrutins/Scrutins.json.zip` (26 Mo, 8 434 fichiers).
+
+### 1.1 Nature des scrutins
+
+| Type de vote | Nombre | Part |
+|---|---|---|
+| Scrutin public ordinaire (`SPO`) | 8 339 | 98,9 % |
+| Scrutin public solennel (`SPS`) | **72** | 0,9 % |
+| Motion de censure (`MOC`) | 23 | 0,3 % |
+
+Répartition par **contenu réel du libellé** :
+
+| Catégorie | Nombre | Participation médiane | Exploitable par un LLM ? |
+|---|---|---|---|
+| Solennel | 72 | **532 / 577 (92 %)** | ✅ Oui |
+| « l'ensemble de… » (vote final) | 153 | 146 (25 %) | ✅ Oui |
+| Motion de procédure | 57 | 248 (43 %) | ⚠️ Avec contexte |
+| Motion de censure | 23 | 143 (25 %) | ⚠️ Traitement spécial |
+| Autre | 908 | 113 (20 %) | ⚠️ Variable |
+| **Amendement / sous-amendement** | **7 221** | 136 (24 %) | ❌ **Non** |
+
+### 1.2 Le problème central : des libellés vides de sens
+
+Voici des `titre` réels tirés du corpus — c'est **la seule chose** que reçoit Gemini aujourd'hui :
+
+```
+l'amendement n° 1762 de M. Le Coq et l'amendement identique suivant à l'article 2
+du projet de loi de finances pour 2025 (première lecture).
+
+le sous-amendement n° 48 de M. Jean-Philippe Tanguy à l'amendement n° 22 de
+M. de Courson à l'article 2 de la proposition de loi visant à lutter contre les
+fermetures abusives de comptes bancaires (première lecture).
+```
+
+Aucun modèle, quel qu'il soit, ne peut déterminer si l'amendement n° 1762 va dans le sens de la promesse « TVA à 0 % sur les produits de première nécessité ». **Le contenu de l'amendement n'est pas dans le fichier des scrutins.** Le LLM va néanmoins produire une polarité et une `confidence` — c'est précisément le mécanisme qui fabrique un score qui « ne semble pas satisfaisant ».
+
+À comparer avec un libellé de scrutin solennel :
+
+```
+l'ensemble de la proposition de loi visant à sortir la France du piège du
+narcotrafic (première lecture).
+```
+
+Celui-ci est parfaitement classifiable.
+
+### 1.3 Ce que le pipeline n'exploite pas
+
+Le JSON de l'AN contient des champs directement utiles, aujourd'hui tous ignorés :
+
+| Champ | Disponibilité | Usage recommandé |
+|---|---|---|
+| `typeVote.codeTypeVote` | 100 % | Filtrage + pondération (SPS ≫ SPO) |
+| `objet.dossierLegislatif.dossierRef` | **2 608** scrutins (31 %) | Jointure vers *Dossiers législatifs* → titre substantiel + exposé des motifs |
+| `objet.dossierLegislatif.libelle` | 2 608 | Contexte immédiat pour le LLM (ex. « L'intérêt des enfants ») |
+| `demandeur.texte` | ~100 % | Signal fort (« Présidente du groupe RN ») |
+| `sort.code` | 100 % | `sort_adopte` — colonne `NOT NULL` jamais remplie |
+| `numero` | 100 % | Colonne `NOT NULL` jamais remplie |
+| `nombreMembresGroupe` (par groupe) | 100 % | **Permet enfin de calculer l'absence** |
+| `parDelegation` | **191 629 votes (15 %)** | Vote par procuration ≠ présence |
+| `miseAuPoint` | fréquent | Corrections de vote déclarées a posteriori |
+| `nonVotantsVolontaires` | 0 sur L17 | (rien à faire, mais à parser par sécurité) |
+
+### 1.4 Volumétrie
+
+1 270 476 lignes de votes individuels sur la législature complète. Avec index, on approche les limites des **500 Mo** du plan Supabase Free. En se restreignant aux 1 213 scrutins exploitables : **~180 000 lignes**, soit une marge confortable.
+
+---
+
+## 2. Bugs bloquants (P0) — à corriger avant toute discussion de méthodologie
+
+### P0-1 — `fact_scrutin` : violation de contraintes `NOT NULL`
+
+`supabase/functions/etl-nightly/index.ts:423`
+
+```ts
+.insert({
+  uid_an, date_scrutin, objet, expose_des_motifs, llm_traite, pertinent
+})
+```
+
+Le schéma (`civic_tech.sql:57`) impose `NOT NULL` sur **`numero`**, **`titre`** et **`sort_adopte`**, jamais fournis. Chaque insertion échoue, l'erreur est loguée puis `continue` → **le pipeline tourne « avec succès » en n'insérant rien**. C'est le mode de défaillance le plus dangereux : silencieux.
+
+Second point : `objet` reçoit `scrutin.titre` alors que `scrutin.objet.libelle` existe, et `expose_des_motifs` est écrit en dur à `""`.
+
+### P0-2 — `llm_classification` : colonne inexistante + `NOT NULL` manquant
+
+`supabase/functions/etl-nightly/index.ts:599`
+
+```ts
+statut: c.confidence >= CONFIDENCE_THRESHOLD ? "auto" : "review",
+```
+
+La colonne s'appelle **`statut_validation`**. De plus **`modele_llm`** est `NOT NULL` et absent. L'insert est fait en **un seul batch tableau** : une seule ligne fautive (ou un `promesse_id` halluciné violant la clé étrangère) annule **toutes** les classifications du scrutin.
+
+### P0-3 — Le calcul de score n'existe nulle part
+
+`cache_score_groupe` et `cache_score_depute` sont définies dans le schéma, documentées dans `AGENT.md`… et jamais écrites : aucune fonction PL/pgSQL, aucun script, aucune référence dans `src/`. La page d'accueil `src/app/page.tsx` est encore le template `create-next-app`.
+
+**C'est le vrai sujet de cet audit** : la formule doit être spécifiée avant d'être codée (§4).
+
+### P0-4 — Bugs secondaires du même fichier
+
+| Ligne | Problème |
+|---|---|
+| `509` | `syntheseVote.libelle`, `nbreSuffragesPour`, `nbreSuffragesContre` **n'existent pas** dans le JSON AN (les vrais champs sont `annonce` et `decompte.pour/contre`). Le prompt envoie donc toujours `RÉSULTAT : inconnu (0 pour, 0 contre)`. |
+| `296` | `select("uid_an")` sans pagination → **plafonné à 1 000 lignes** par PostgREST. Au-delà de 1 000 scrutins en base, la déduplication devient fausse. |
+| `330` | Idem pour `dim_promesse`. Avec 11 groupes × 50-150 promesses, on dépasse 1 000 → **des promesses disparaissent silencieusement** du contexte de classification. |
+| `311` | `if (nouveauxScrutins.length >= maxScrutins) break;` — l'itération suit l'ordre **alphabétique du ZIP** (`V1`, `V10`, `V100`, `V1000`…), pas l'ordre chronologique. Avec 1 117 scrutins sur le seul mois de novembre 2025 et un plafond de 50/nuit + `LOOKBACK_DAYS=7`, des scrutins sont **définitivement perdus** — et le sous-échantillon retenu est arbitraire, donc potentiellement biaisé. |
+| `287` | Le parsing complet du ZIP (8 434 fichiers, inflate individuel) dans une Edge Function limitée à **2 s de CPU** sur le plan Free est très probablement au-delà du budget. À mesurer. |
+| `597` | `prompt_hash` = `btoa(...)` tronqué à 32 caractères dans une colonne `char(64)` : ce n'est pas un SHA-256, la traçabilité annoncée n'est pas assurée. |
+| `480` | `groupe_id_au_moment_du_vote: dep.groupe_id` → le groupe **actuel**. Le `.dbml` documente pourtant explicitement l'inverse comme garantie anti-manipulation. |
+
+---
+
+## 3. Problèmes de fiabilité des données (P1)
+
+### 3.1 L'absence n'existe pas dans le modèle
+
+Un député absent **n'apparaît dans aucune liste** du JSON. Le pipeline ne crée donc aucune ligne pour lui. Conséquences :
+
+- Sur un scrutin ordinaire médian, **442 députés sur 577 sont invisibles**.
+- Un député dont le score repose sur 12 scrutins et un autre sur 300 reçoivent le même affichage météo, avec la même apparence d'autorité.
+- Un député qui n'est présent que sur les votes où il est d'accord avec son programme obtient mécaniquement 100/100. **Le score actuel récompense l'absentéisme sélectif.**
+
+`nombreMembresGroupe` est présent dans chaque bloc groupe : l'absence est donc **calculable**. Il faut la matérialiser explicitement (`position_vote = NULL` + un motif), et surtout **ne jamais la mélanger au score de cohérence**.
+
+### 3.2 Promesses dupliquées entre groupes
+
+`partage.json` attribue :
+- le programme NFP à **LFI-NFP, SOC, ECOS, GDR**
+- le programme Ensemble à **EPR, HOR, DEM**
+
+`02-extract-promesses.ts:415` insère une ligne `dim_promesse` **par groupe**, avec un `id` distinct pour un texte identique. L'ETL demande ensuite à Gemini de classer chacune séparément. **Deux promesses au texte rigoureusement identique peuvent recevoir des polarités ou des confiances différentes** — et donc faire diverger les scores de LFI-NFP et du groupe SOC pour des raisons de pur bruit stochastique. C'est indéfendable si un journaliste s'en aperçoit.
+
+Correctif : une table `dim_promesse` canonique (dédupliquée par `dedupe_hash` sur le texte seul) + une table de liaison `promesse_groupe`. Une seule classification LLM, réutilisée par tous les groupes signataires.
+
+Conséquence connexe : **UDR (UDDPLR) et NI n'ont aucun programme** dans `scripts/data/programmes/`. Ils ne peuvent donc pas avoir de score — il faut l'afficher comme tel, pas les laisser à 0 ou absents sans explication.
+
+Question éditoriale à trancher et à documenter publiquement : attribuer le programme « Ensemble » à HOR et DEM, et le programme NFP à quatre groupes distincts, est une hypothèse forte qui sera contestée. Elle doit être assumée en toutes lettres dans le « Mode Expert ».
+
+### 3.3 Le `confidence_score` du LLM n'est pas une mesure de fiabilité
+
+Le seuil `CONFIDENCE_THRESHOLD = 0.7` sur une confiance auto-déclarée par le modèle est un faux filet de sécurité. La littérature est constante : les confiances verbalisées par les LLM sont **systématiquement sur-confiantes et mal calibrées** ([On Verbalized Confidence Scores for LLMs](https://arxiv.org/html/2412.14737v2), [Assessing and Mitigating Miscalibration in LLM-Based Social Science Measurement](https://arxiv.org/html/2605.11954v1)).
+
+Substitut robuste et peu coûteux : **l'accord inter-passes**. Classer deux fois (deux prompts formulés différemment, ou deux modèles), ne retenir en `auto` que les accords, router les désaccords vers `/admin`. C'est la recommandation issue des travaux sur la fiabilité de l'annotation LLM en science politique ([Semantic stability protocol](https://link.springer.com/article/10.1007/s11135-026-02832-9)).
+
+### 3.4 Un seul appel pour ~1 000 promesses
+
+Le Context Cache contient toutes les promesses de tous les groupes, tronquées à 100 caractères de citation. On demande au modèle de renvoyer uniquement les liens non nuls parmi ~1 000 candidats, en une passe. C'est le pire régime pour le rappel, et un terrain fertile pour les `promesse_id` hallucinés — jamais validés contre la liste envoyée avant l'`INSERT`.
+
+Correctif : **pré-filtrage** avant appel LLM. Un filtre lexical (mots-clés par thème) ou par embeddings ramène le candidat set à 20-40 promesses, ce qui améliore simultanément le rappel, la précision et le coût.
+
+---
+
+## 4. Méthodologie du score — spécification proposée
+
+C'est le cœur du sujet. Voici une formule défendable, auditable et calculable en SQL.
+
+### 4.1 Principe directeur : trois indicateurs, jamais un seul
+
+Le mélange « absence + abstention + incohérence » dans un chiffre unique est ce qui rend n'importe quel score de ce type attaquable. Séparer :
+
+| Indicateur | Ce qu'il mesure | Affichage |
+|---|---|---|
+| **Cohérence** | Sur les votes exprimés et rattachés à une promesse : le vote va-t-il dans le sens de l'engagement ? | ☀️ Météo principale |
+| **Présence** | Part des scrutins retenus où le député a exprimé un vote | Badge séparé |
+| **Couverture** | Part des promesses du groupe effectivement testées par au moins un scrutin | Note de bas de page + Mode Expert |
+
+La **couverture** est indispensable à la neutralité : l'ordre du jour est fixé par le gouvernement, donc *quelles* promesses sont mises à l'épreuve n'a rien d'aléatoire. Un groupe d'opposition dont 8 % des promesses ont été testées ne peut pas être comparé à un groupe de la majorité dont 40 % l'ont été. Il faut l'écrire.
+
+### 4.2 Sélection du corpus (le levier n°1)
+
+Ne classifier que les scrutins **`eligible = true`** :
+
+```sql
+-- Corpus retenu : ~1 213 scrutins sur 8 434 (14 %)
+eligible :=
+     type_vote = 'SPS'                        -- solennel      (72)
+  OR type_vote = 'MOC'                        -- censure       (23)
+  OR titre ILIKE 'l''ensemble %'              -- vote final    (153)
+  OR (dossier_ref IS NOT NULL AND type_vote = 'SPO' AND titre NOT ILIKE '%amendement%')
+```
+
+Les amendements ne redeviennent éligibles qu'après enrichissement par le jeu de données *Amendements* de l'AN (qui contient `dispositif` et `exposeSommaire`, seuls textes réellement classifiables). À traiter en V2.
+
+Effets : coût LLM divisé par ~7, volume DB divisé par ~7, et surtout **suppression de la principale source de bruit**.
+
+### 4.3 Formule
+
+Pour un député `d`, un thème `t` (ou tous), sur les scrutins éligibles :
+
+**Étape 1 — alignement élémentaire** pour un couple (scrutin `s`, promesse `p`) :
+
+```
+a(s,p) = position_vote(d,s) × polarite(s,p)     ∈ {-1, 0, +1}
+```
+
+**Étape 2 — agrégation intra-scrutin** (correctif majeur) :
+
+```
+A(d,s) = moyenne des a(s,p) sur les promesses p liées à s
+```
+
+Sans cette étape, un scrutin rattaché à 12 promesses pèse 12 fois plus qu'un scrutin rattaché à une seule. Une seule loi de finances écraserait tout le reste du score.
+
+**Étape 3 — pondération du scrutin** :
+
+```
+w(s) = w_type(s) × w_abst(d,s)
+
+w_type : solennel = 3 | vote final « l'ensemble » = 2 | autre = 1
+w_abst : abstention = 0,5 (A = 0)   |   vote exprimé = 1
+```
+
+L'abstention à demi-poids est un **choix éditorial** : elle ne prouve pas l'incohérence, mais ne peut pas non plus être ignorée. À documenter publiquement — quelle que soit l'option, elle doit être explicite.
+
+**Étape 4 — score brut et normalisation** :
+
+```
+score_brut = Σ w(s)·A(d,s) / Σ w(s)          ∈ [-1, +1]
+score_0_100 = round( (score_brut + 1) × 50 ) ∈ [0, 100]
+```
+
+**Étape 5 — rétrécissement (shrinkage) vers le groupe** :
+
+```
+n_eff = Σ w(s)
+score_final = (n_eff × score_depute + k × score_groupe) / (n_eff + k)     avec k = 8
+```
+
+Sans cela, un député avec 3 scrutins et un député avec 200 sont affichés avec la même assurance. Le shrinkage bayésien est la correction standard et se justifie en une phrase auprès du public : *« tant qu'on a peu de votes, on part de la position de son groupe »*.
+
+**Étape 6 — seuil de publication** :
+
+```
+si n_eff < 10  →  pas de météo. Afficher 🌫️ « Données insuffisantes »
+```
+
+Une cinquième catégorie météo « Brouillard » s'intègre naturellement à la métaphore et vaut mieux qu'un chiffre faux. Elle protège aussi juridiquement.
+
+**Étape 7 — intervalle de crédibilité** : calculer un IC à 95 % par bootstrap sur les scrutins. Si l'intervalle chevauche deux catégories météo (ex. Nuages / Éclaircies), afficher la catégorie basse et l'incertitude. Le stocker dans `cache_score_depute` (`score_ic_bas`, `score_ic_haut`).
+
+### 4.4 Cas particuliers à coder explicitement
+
+| Cas | Traitement |
+|---|---|
+| **Motion de censure** | Vérifié sur `VTANR5L17V1` : `pour = 197, contre = 0, abstentions = 0`. **Seuls les votes « pour » sont enregistrés** — le règlement ne compte pas les opposants. Ne jamais traiter les non-votants comme des opposants. Poids nul dans la cohérence, ou indicateur dédié. |
+| **Vote par délégation** (15 % des votes) | Compte pour la cohérence, **ne compte pas** pour la présence. Le champ `parDelegation` doit être persisté. |
+| **`miseAuPoint`** | Corrections de vote déclarées après coup. Les ignorer expose à des démentis publics documentés. À parser et appliquer. |
+| **Changement de groupe** | Le score doit utiliser `dim_depute_groupe_historique` à la date du vote, à la fois pour `groupe_id_au_moment_du_vote` **et** pour choisir les promesses de référence. |
+| **Députés partis / arrivés** | Normaliser par les scrutins postérieurs à leur entrée en fonction, pas par le total de la législature. |
+| **Polarités contradictoires dans un même scrutin** | Un texte peut servir la promesse A et trahir la promesse B. La moyenne (étape 2) les annule. C'est du signal, pas du bruit : l'exposer dans le Mode Expert comme « arbitrage » plutôt que de le dissoudre. |
+
+### 4.5 Où calculer
+
+Une fonction PL/pgSQL `refresh_scores()` appelée en fin d'ETL, plutôt qu'en TypeScript : c'est un `INSERT … SELECT` avec `GROUP BY`, la base le fera en quelques centaines de ms, et le calcul reste **auditable par n'importe qui ayant accès au schéma** — argument de neutralité qui est aussi un argument produit.
+
+---
+
+## 5. Comment prouver que le score est fiable
+
+Sans mesure, « fiable » est une opinion. Protocole minimal, réalisable en une journée :
+
+1. **Jeu de référence (gold standard)** : annoter à la main 150-200 couples (scrutin, promesse), stratifiés par groupe et par thème, dont une part de non-liens. C'est le seul investissement manuel incompressible.
+2. **Métriques du mapping** : précision, rappel, F1 sur « ce scrutin concerne-t-il cette promesse ? ». La borne d'alerte est basse : la classification zero-shot de texte politique par LLM peut descendre à des F1 très faibles sans prompt calibré ([Political DEBATE, *Political Analysis*](https://www.cambridge.org/core/journals/political-analysis/article/political-debate-efficient-zeroshot-and-fewshot-classifiers-for-political-text/8D0B3E2AAF711F4812E42466DE503A13)).
+3. **Métrique de la polarité** : exactitude sur ±1, conditionnellement à un mapping correct. C'est le chiffre qui compte le plus, car une polarité inversée transforme un ☀️ en ⛈️.
+4. **Stabilité** : rejouer deux fois le même corpus, mesurer l'alpha de Krippendorff entre les deux passes. À `temperature: 0` on doit être très haut ; si ce n'est pas le cas, le prompt est ambigu.
+5. **Sensibilité** : recalculer les scores en faisant varier les choix éditoriaux (poids de l'abstention 0 / 0,5 / 1, `k` du shrinkage 5 / 8 / 15). Si le classement météo des groupes bascule, le score est trop fragile pour être publié tel quel — et ce test doit être refait à chaque évolution.
+6. **Publier ces chiffres dans l'app.** Un F1 de 0,78 affiché honnêtement vaut infiniment mieux qu'un score muet. C'est aussi le meilleur bouclier contre l'accusation de partialité.
+
+Sur le cadrage plus large, la référence académique est le [Comparative Party Pledges Project](https://comparativepledges.net/publications/) : leur définition d'un engagement — *une déclaration engageant un parti sur une action spécifique dont on peut déterminer clairement si elle a eu lieu* — est plus stricte que le filtre de `03-review-promesses.ts`, et vaut d'être adoptée telle quelle.
+
+---
+
+## 6. Plan d'action priorisé
+
+### Sprint 1 — Débloquer ✅ **fait**
+
+1. ✅ Corriger l'insertion `fact_scrutin` : ajouter `numero`, `titre`, `sort_adopte` (`sort.code === 'adopté'`), `legislature`, `url_an` ; mapper `objet` sur `objet.libelle`.
+2. ✅ Corriger l'insertion `llm_classification` : `statut` → `statut_validation`, ajouter `modele_llm`. Passer en `upsert` sur `(scrutin_id, promesse_id)`, avec repli **ligne par ligne** pour qu'une erreur n'annule pas le lot.
+3. ✅ Valider les `promesse_id` retournés contre la liste envoyée avant insertion (+ rejet des polarités `0` et des doublons).
+4. ✅ Paginer tous les `select()` de l'ETL par `range()`.
+5. ✅ Faire échouer l'ETL bruyamment : si `scrutins_inseres === 0` alors que `scrutins_traites > 0`, statut `error` dans `etl_run_log` et HTTP 500.
+
+Correctifs supplémentaires nécessaires pour que le point 5 fonctionne, ou trop risqués pour être différés :
+
+6. ✅ `etl_run_log` : l'INSERT visait 5 colonnes inexistantes (`dry_run`, `scrutins_traites`, `scrutins_inseres`, `classifications_inserees`, `erreur`) et omettait `run_type` (`NOT NULL`). **Même la journalisation des erreurs échouait** — l'ETL était totalement muet.
+7. ✅ `syntheseVote.libelle` / `nbreSuffragesPour` / `nbreSuffragesContre` n'existent pas : remplacés par `sort.libelle` et `syntheseVote.decompte.*`. Le modèle recevait jusqu'ici « RÉSULTAT : inconnu (0 pour, 0 contre) » sur **100 %** des scrutins.
+8. ✅ `prompt_hash` : vrai SHA-256 (64 caractères) du couple (modèle, prompt système) au lieu d'un `btoa()` tronqué à 32.
+9. ✅ Tri chronologique des scrutins **avant** application de `max_scrutins` (le ZIP est ordonné `V1, V10, V100…` : le plafond découpait un sous-ensemble arbitraire).
+10. ✅ `llm_traite` désormais positionné même quand aucun lien n'est trouvé, et laissé à `false` si l'appel Gemini échoue (rejouable).
+11. ✅ Erreurs d'insertion des votes remontées au lieu d'être ignorées ; parsing de `nonVotantsVolontaires` ajouté.
+
+**Architecture** : la logique pure (types AN, normalisation, construction des lignes, validation des sorties LLM) est extraite dans `supabase/functions/etl-nightly/lib.ts`, sans aucune dépendance externe. Elle est donc importable à la fois par la Edge Function (Deno) et par un script de vérification local, ce qui rend l'ETL testable **sans base ni appel LLM**.
+
+**Vérification** — `npx tsx scripts/04-verify-etl-mapping.ts` rejoue le mapping sur le corpus réel :
+
+```
+29/29 contrôles OK sur 8434 scrutins
+  ✅ Colonnes NOT NULL de fact_scrutin            les 7 colonnes NOT NULL sont renseignées
+  ✅ Toutes les valeurs de sort.code reconnues    repli utilisé 0×
+  ✅ sort_adopte cohérent avec l'annonce          0 désaccord
+  ✅ Aucun votant perdu à l'extraction            1 270 476 extraits / 1 270 476 attendus
+  ✅ Résultat du vote toujours renseigné          0 "inconnu"
+  ✅ promesse_id halluciné / doublon rejetés
+```
+
+Restent volontairement hors périmètre du Sprint 1, et toujours signalés par un commentaire dans le code : `groupe_id_au_moment_du_vote` (groupe actuel, à résoudre via l'historique — Sprint 2), la file d'attente persistante remplaçant `max_scrutins` (Sprint 2), et la migration de modèle (§8).
+
+### Sprint 2 — Fiabiliser l'entrée (2 à 3 jours)
+
+6. Ajouter `type_vote`, `dossier_ref`, `demandeur`, `eligible` à `fact_scrutin`. Implémenter le filtre du §4.2 **avant** tout appel LLM.
+7. Trier les scrutins par date avant d'appliquer `max_scrutins`, et remplacer le plafond par une file d'attente persistante (`llm_traite = false`) pour ne rien perdre.
+8. Dédupliquer `dim_promesse` (table canonique + `promesse_groupe`).
+9. Persister `par_delegation`, appliquer les `miseAuPoint`, résoudre `groupe_id_au_moment_du_vote` via l'historique.
+10. Pré-filtrer les promesses candidates par thème avant l'appel Gemini.
+
+### Sprint 3 — Le score (2 à 3 jours)
+
+11. Écrire `refresh_scores()` en PL/pgSQL selon le §4.3, avec `n_eff`, shrinkage, IC et seuil de publication.
+12. Ajouter la catégorie météo 🌫️ « Données insuffisantes ».
+13. Calculer et stocker les indicateurs **Présence** et **Couverture**, séparés de la cohérence.
+
+### Sprint 4 — Prouver (1 à 2 jours)
+
+14. Constituer le gold standard (150-200 couples).
+15. Script `04-evaluate-classifications.ts` : F1 mapping, exactitude polarité, alpha inter-passes, analyse de sensibilité.
+16. Passer la classification en double passe, `auto` uniquement sur accord.
+17. Publier la méthodologie et les métriques dans une page `/methodologie`.
+
+---
+
+## 7. Les 6 arbitrages éditoriaux — recommandations argumentées
+
+Ces choix conditionnent le score et doivent être arrêtés **puis publiés**. C'est ce qui fait la différence entre un baromètre et une opinion. Recommandation pour chacun, avec le raisonnement.
+
+### 7.1 Abstention → **neutre à demi-poids** (`A = 0`, `w = 0,5`)
+
+| Option | Effet | Verdict |
+|---|---|---|
+| Ignorée (hors numérateur *et* dénominateur) | L'abstention devient invisible | ❌ L'abstention est précisément la façon d'esquiver un engagement sans trahison visible. L'ignorer, c'est laisser passer la stratégie la plus courante. |
+| Pénalisée (`A = -1` ou `-0,5`) | Assimilée à une trahison | ❌ Indéfendable : on s'abstient légitimement sur un texte qui mêle une mesure conforme et une mesure contraire. |
+| **Neutre à demi-poids** | Contribue 0 au numérateur, 0,5 au dénominateur | ✅ **Retenu** |
+
+**Pourquoi ça marche** : avec `score_brut = Σw·A / Σw`, une abstention tire mécaniquement le score vers 0, donc l'affichage vers 50/100 — la zone ☁️ **Nuages**. La propriété est élégante à expliquer au public : *« un groupe qui s'abstient systématiquement sur ses propres engagements finit sous les nuages, pas sous l'orage »*. C'est exactement la sémantique voulue.
+
+**À ajouter obligatoirement** : un indicateur publié séparément, *« taux d'abstention sur ses propres engagements »*. La stratégie d'esquive devient ainsi une donnée factuelle affichée, pas un résidu dissous dans le composite.
+
+### 7.2 Absence → **jamais dans la cohérence**, indicateur séparé limité aux solennels
+
+Deux raisons de ne jamais la faire entrer dans le score de cohérence :
+
+1. **Factuelle** : maladie, congé maternité, fonction ministérielle, mission parlementaire, déplacement officiel. Assimiler cela à une trahison d'engagement est faux, et juridiquement exposé.
+2. **Technique** : **15 % des votes sont par délégation** (191 629 mesurés). Un député « présent » dans les données peut être physiquement absent. Le signal de présence est intrinsèquement bruité.
+
+**Mais la présence doit être publiée**, comme indicateur autonome et **calculée uniquement sur les scrutins solennels**. Justification mesurée : la participation médiane y est de **92 %**, donc la norme est claire et un écart est signifiant. Sur les scrutins ordinaires (26 %), l'absence *est* la norme — un taux de présence y serait ininterprétable. C'est d'ailleurs la distinction qu'opère [Datan](https://datan.fr/statistiques/aide) entre participation aux solennels et participation à tous les votes.
+
+**Précision de calcul** : exclure du dénominateur d'un député tout scrutin antérieur à son entrée en fonction ou postérieur à son départ.
+
+### 7.3 Programmes communs → **on maintient, mais on change le statut de l'information**
+
+Supprimer l'attribution reviendrait à priver **7 groupes sur 11** de toute promesse — plus de produit. Et ce serait factuellement faux : ces groupes *ont* fait campagne sur ces textes. Mais les deux cas ne se valent pas :
+
+| Coalition | Solidité de l'attribution | Analyse |
+|---|---|---|
+| **NFP** → LFI-NFP, SOC, ECOS, GDR | Forte | Plateforme commune réellement signée, candidats investis sous label unique en juin 2024. C'est bien le document sur lequel ils ont fait campagne. |
+| **Ensemble** → EPR, HOR, DEM | Plus faible | Horizons et le MoDem ont publié leurs propres supports et se sont distanciés à plusieurs reprises. |
+
+**Recommandation** : garder l'attribution, mais la rendre **visible et qualifiée** plutôt que silencieuse.
+
+- Ajouter `promesse_groupe.type_engagement ∈ {'programme_propre', 'programme_coalition'}`.
+- Marqueur visuel distinct en UI + phrase explicite : *« engagement issu du programme commun X, sur lequel ce groupe a fait campagne »*.
+- Quand les deux existent, publier **deux scores** : sur programme propre / sur programme de coalition. L'écart est en soi une information intéressante.
+
+Le principe de divulgation progressive déjà inscrit dans la spec produit s'applique : on n'efface pas l'hypothèse, on la rend inspectable et on laisse le lecteur juger.
+
+### 7.4 UDR et NI → deux traitements différents, aucun score inventé
+
+- **NI (non-inscrits)** : par définition aucun programme commun. L'exclusion est déjà actée dans `AGENT.md` et elle est correcte. Affichage : *« pas de programme commun — score de cohérence non applicable »*. Les votes individuels de ces députés restent consultables factuellement, sans note.
+- **UDR (UDDPLR)** : cas plus délicat. Le groupe s'est allié au RN pour les législatives 2024, mais **je n'ai pas trouvé de document de campagne publié en propre**. Lui attribuer le programme RN serait une hypothèse bien plus forte que le cas NFP (il n'existe pas de texte co-signé équivalent) — exactement le raccourci qui fait tomber un projet de neutralité.
+
+**Recommandation** : **pas de score pour l'UDR en V1**. Afficher 🌫️ *« programme de campagne non disponible — nous n'avons pas identifié de document publié par ce groupe »*, avec un appel à contribution pour la source. C'est honnête, et cela transforme une lacune en signal de rigueur. À rouvrir si un document sourçable est identifié.
+
+### 7.5 Seuil de publication → **n_eff ≥ 10** pour un député, **≥ 30** pour un groupe
+
+La justification est purement mathématique, donc facile à défendre publiquement. Sur des valeurs dans `{-1, 0, +1}` d'écart-type ≈ 0,8 :
+
+| n_eff | Erreur-type | IC 95 % sur l'échelle 0-100 |
+|---|---|---|
+| 5 | 0,36 | **± 36 points** — plus large que deux catégories météo |
+| 10 | 0,25 | ± 25 points — une catégorie entière |
+| 20 | 0,18 | ± 17 points |
+| 50 | 0,11 | ± 11 points |
+
+En dessous de 10, l'intervalle de confiance dépasse la largeur d'une catégorie météo : le score n'a **aucune valeur informative**, il ne fait qu'habiller du bruit. 10 est donc un plancher absolu, pas un confort ; **c'est à partir de ~20 que le score devient réellement lisible**.
+
+Dans tous les cas : afficher `n_eff` à côté du score, et l'intervalle de confiance en Mode Expert. Sous le seuil → 🌫️ **Brouillard**, jamais un chiffre.
+
+### 7.6 Amendements → **hors champ en V1**, réouverture ciblée en V2
+
+Quatre raisons convergentes :
+
+1. Le libellé seul est inexploitable (§1.2) — il faut joindre le jeu de données *Amendements* pour obtenir `dispositif` et `exposeSommaire`. La jointure passe par du parsing de texte libre (numéro + article + intitulé du texte) : fragile et coûteux à fiabiliser.
+2. Participation médiane de 24 % → faible valeur au niveau député.
+3. **C'est là que le vote tactique est le plus dense** : voter contre son propre amendement pour raisons de procédure, voter pour un amendement destiné à faire tomber le texte. Le rapport signal/bruit y est le pire de tout le corpus.
+4. Les 1 213 scrutins non-amendements portent déjà le signal fort.
+
+**V2 ciblée, pas exhaustive** : ne rouvrir que les amendements portant sur les dossiers ayant *déjà* fait l'objet d'un vote solennel ou d'un vote final. Ensemble bien plus petit, à forte valeur politique, et joignable proprement via `dossierRef`.
+
+---
+
+## 8. Choix du modèle IA — le contexte a changé
+
+### 8.1 Alerte immédiate : les modèles utilisés s'arrêtent le 16 octobre 2026
+
+D'après la [page officielle des dépréciations Google](https://ai.google.dev/gemini-api/docs/deprecations) :
+
+| Modèle | Utilisé dans | Date d'arrêt | Remplaçant officiel |
+|---|---|---|---|
+| `gemini-2.5-flash-lite` | `etl-nightly:378,521,550`, `03-review:157` | **16 oct. 2026** | `gemini-3.1-flash-lite` |
+| `gemini-2.5-flash` | `02-extract:206` | **16 oct. 2026** | `gemini-3.6-flash` |
+
+Dans moins de trois mois, l'intégralité du pipeline cesse de fonctionner. Les coûts sont eux aussi codés en dur (`etl-nightly:583`, `02-extract:242`) et déjà faux.
+
+### 8.2 Catalogue actuel (juillet 2026, prix officiels Google)
+
+| Modèle | Input $/M | Output $/M | Cache read | Statut |
+|---|---|---|---|---|
+| `gemini-2.5-flash-lite` | 0,10 | 0,40 | 0,01 | ⚠️ arrêt 16 oct. 2026 |
+| `gemini-3.1-flash-lite` | 0,25 | 1,50 | — | GA, remplaçant de 2.5 FL |
+| `gemini-3.5-flash-lite` | 0,30 | 2,50 | 0,03 | Sorti le 21 juil. 2026 |
+| `gemini-2.5-flash` | 0,30 | 2,50 | 0,03 | ⚠️ arrêt 16 oct. 2026 |
+| `gemini-3.5-flash` | 1,50 | 9,00 | 0,15 | GA (19 mai 2026) |
+| `gemini-3.6-flash` | 1,50 | 7,50 | 0,15 | Sorti le 21 juil. 2026 |
+
+Deux faits utiles : le **Batch API** offre **-50 %** avec un SLA de 24 h — parfait pour un ETL nocturne sans contrainte de latence. Et `gemini-3.6-flash` consomme **17 % de tokens de sortie en moins** que 3.5 Flash tout en étant moins cher.
+
+### 8.3 Le raisonnement décisif : le coût n'est plus le critère
+
+L'architecture d'origine imposait Flash-Lite partout à cause du budget < 5 €/mois. Ce raisonnement supposait 8 434 scrutins à classifier. **Avec le corpus filtré à 1 213 scrutins (§4.2), la contrainte disparaît.**
+
+Estimation pour le backfill complet de la législature, en double passe, avec pré-filtrage à ~30 promesses candidates (≈ 2 500 tokens in / 300 tokens out par appel) :
+
+| Modèle | Backfill complet (une fois) | Régime de croisière |
+|---|---|---|
+| `gemini-3.1-flash-lite` | ~2,60 $ (1,30 $ en Batch) | ~0,10 $/mois |
+| `gemini-3.5-flash-lite` | ~3,65 $ (1,80 $ en Batch) | ~0,15 $/mois |
+| `gemini-3.6-flash` | ~14,60 $ (7,30 $ en Batch) | ~0,60 $/mois |
+
+**Le modèle le plus cher coûte 12 $ de plus, une seule fois, et 0,50 $/mois de plus.** Le budget est préservé dans tous les cas. Le critère de choix redevient donc ce qu'il aurait toujours dû être : **la justesse**, car une polarité inversée transforme un ☀️ en ⛈️ et détruit la crédibilité du projet.
+
+### 8.4 Recommandation par tâche
+
+| Tâche | Modèle recommandé | Justification |
+|---|---|---|
+| **Extraction PDF** (`02-extract`) | **`gemini-3.6-flash`** | C'est la *ground truth* de tout le système. Une promesse mal extraite contamine tous les scores en aval. One-shot sur ~7 documents, coût ≈ 2 $. Aucune raison d'économiser ici. |
+| **Classification — passe A** (ETL) | **`gemini-3.6-flash`** | La tâche la plus difficile et la plus lourde de conséquences du pipeline. |
+| **Classification — passe B** (ETL) | **`gemini-3.5-flash-lite`** | Deuxième avis avec un modèle **d'une famille différente** : les erreurs sont bien moins corrélées qu'entre deux appels du même modèle. L'accord inter-modèles est un estimateur de confiance nettement plus solide que la `confidence` auto-déclarée (§3.3). Désaccord → `/admin`. |
+| **Relecture qualité promesses** (`03-review`) | **`gemini-3.5-flash-lite`** | Contrôle formel (neutralité, concordance, concrétude). Tâche simple, volume élevé. |
+| **Pré-filtrage des promesses candidates** | **aucun LLM** | Filtre lexical par thème, ou embeddings. Réduit ~1 000 promesses à 20-40 candidates : améliore simultanément rappel, précision et coût. |
+
+**À supprimer** : le Context Cache. Avec le pré-filtrage, chaque appel porte sur un jeu de promesses différent — le cache perd sa raison d'être. Il apporte aujourd'hui un chemin de code de repli buggé (`index.ts:547-565`) pour une économie de quelques centimes. Le retirer est un gain net de fiabilité.
+
+**À ajouter** : passer les appels par le **Batch API** (-50 %, SLA 24 h), parfaitement compatible avec un traitement nocturne — et qui supprime au passage la pression sur les rate limits du free tier.
+
+---
+
+## Sources
+
+- [Data Assemblée nationale — portail open data](https://data.assemblee-nationale.fr/)
+- [Votes et scrutins — Opendata AN](https://data.assemblee-nationale.fr/travaux-parlementaires)
+- [Tous les amendements — Opendata AN](https://data.assemblee-nationale.fr/travaux-parlementaires/amendements/tous-les-amendements)
+- [Datan — Les statistiques expliquées (loyauté, participation, Agreement Index)](https://datan.fr/statistiques/aide)
+- [Datan — La loyauté politique des députés](https://datan.fr/statistiques/deputes-loyaute)
+- [Comparative Party Pledges Project — publications](https://comparativepledges.net/publications/)
+- [Thomson et al., *The Fulfillment of Parties' Election Pledges*, AJPS 2017](https://ajps.org/2017/06/07/the-fulfillment-of-parties-election-pledges-a-comparative-study-on-the-impact-of-power-sharing/)
+- [*Political DEBATE: Efficient Zero-Shot and Few-Shot Classifiers for Political Text*, Political Analysis](https://www.cambridge.org/core/journals/political-analysis/article/political-debate-efficient-zeroshot-and-fewshot-classifiers-for-political-text/8D0B3E2AAF711F4812E42466DE503A13)
+- [*On Verbalized Confidence Scores for LLMs*](https://arxiv.org/html/2412.14737v2)
+- [*Assessing and Mitigating Miscalibration in LLM-Based Social Science Measurement*](https://arxiv.org/html/2605.11954v1)
+- [*Semantic stability protocol: intercoder reliability for zero-shot classification*, Quality & Quantity](https://link.springer.com/article/10.1007/s11135-026-02832-9)
+- [Supabase — limite par défaut de 1 000 lignes par requête](https://supabase.com/docs/reference/javascript/limit)
+- [Gemini API — tarifs officiels](https://ai.google.dev/gemini-api/docs/pricing)
+- [Gemini API — calendrier des dépréciations](https://ai.google.dev/gemini-api/docs/deprecations)
+- [Google — annonce Gemini 3.6 Flash, 3.5 Flash-Lite et 3.5 Flash Cyber (21 juillet 2026)](https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber/)
+- [Google — Gemini 3.1 Flash-Lite](https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-1-flash-lite/)
+- [VentureBeat — Gemini 3.6 Flash cuts agent token costs](https://venturebeat.com/technology/googles-gemini-3-6-flash-model-cuts-ai-agent-token-costs-by-up-to-65-on-long-horizon-engineering-tasks-and-3-5-pro-is-on-the-way)
