@@ -88,6 +88,23 @@ export interface ScrutinAN {
       };
     };
   };
+  /**
+   * Rectifications de vote déclarées après le scrutin.
+   * Chaque catégorie est une LISTE dont les éléments sont soit `null`
+   * (artefact de la conversion XML→JSON), soit `{ votant: … }`.
+   * Mesuré : 1 902 scrutins de la 17e législature en comportent au moins une.
+   */
+  miseAuPoint?: {
+    pours?: MiseAuPointEntry[] | MiseAuPointEntry | null;
+    contres?: MiseAuPointEntry[] | MiseAuPointEntry | null;
+    abstentions?: MiseAuPointEntry[] | MiseAuPointEntry | null;
+    nonVotants?: MiseAuPointEntry[] | MiseAuPointEntry | null;
+    nonVotantsVolontaires?: MiseAuPointEntry[] | MiseAuPointEntry | null;
+  } | null;
+}
+
+export interface MiseAuPointEntry {
+  votant?: Votant | Votant[] | null;
 }
 
 export interface ScrutinFile {
@@ -110,6 +127,23 @@ export interface DeputeRef {
   groupe_id: number;
 }
 
+/** Une ligne de dim_depute_groupe_historique. `date_fin = null` ⇒ groupe actuel. */
+export interface GroupeHistoriqueRow {
+  depute_id: number;
+  groupe_id: number;
+  date_debut: string;
+  date_fin: string | null;
+}
+
+/** Catégorie éditoriale d'un scrutin, dérivée du type de vote et du titre. */
+export type CategorieScrutin =
+  | "solennel"
+  | "motion_censure"
+  | "ensemble_texte"
+  | "motion_procedure"
+  | "amendement"
+  | "autre";
+
 /** Ligne fact_scrutin — toutes les colonnes NOT NULL du schéma sont couvertes. */
 export interface ScrutinRow {
   uid_an: string;
@@ -123,6 +157,14 @@ export interface ScrutinRow {
   url_an: string;
   llm_traite: boolean;
   pertinent: boolean | null;
+  // ── Sprint 2 : sélection du corpus ──
+  type_vote: string | null;
+  libelle_type_vote: string | null;
+  categorie: CategorieScrutin;
+  dossier_ref: string | null;
+  dossier_libelle: string | null;
+  demandeur: string | null;
+  eligible: boolean;
 }
 
 export interface VoteRow {
@@ -130,6 +172,28 @@ export interface VoteRow {
   depute_id: number;
   groupe_id_au_moment_du_vote: number;
   position_vote: 1 | -1 | 0 | null;
+  par_delegation: boolean;
+  position_vote_corrigee: 1 | -1 | 0 | null;
+}
+
+/**
+ * Scrutin relu depuis la base pour la phase de classification.
+ * La phase 2 de l'ETL ne dépend plus du ZIP : tout le contexte nécessaire
+ * au LLM est persisté par la phase 1.
+ */
+export interface ScrutinQueueRow {
+  id: number;
+  uid_an: string;
+  numero: number;
+  titre: string;
+  objet: string;
+  date_scrutin: string;
+  sort_adopte: boolean;
+  type_vote: string | null;
+  libelle_type_vote: string | null;
+  categorie: string | null;
+  dossier_libelle: string | null;
+  demandeur: string | null;
 }
 
 export interface ClassificationBrute {
@@ -192,6 +256,132 @@ export async function sha256Hex(input: string): Promise<string> {
     .join("");
 }
 
+/**
+ * Normalise un libellé AN pour le rendre comparable.
+ *
+ * ⚠️ 541 titres de la 17e législature utilisent l'apostrophe typographique U+2019
+ *    au lieu de l'apostrophe ASCII. Sans cette normalisation, 10 votes sur
+ *    « l'ensemble » d'un texte échappaient au filtre d'éligibilité.
+ */
+export function normalizeText(input: string): string {
+  let out = "";
+  for (const ch of input) {
+    const cp = ch.codePointAt(0)!;
+    if (cp === 0x2018 || cp === 0x2019 || cp === 0x02bc) {
+      out += "'";              // apostrophes typographiques → apostrophe ASCII
+    } else if (cp === 0x00a0 || cp === 0x202f) {
+      out += " ";              // espaces insécables → espace simple
+    } else {
+      out += ch;
+    }
+  }
+  return out.toLowerCase();
+}
+
+/**
+ * Supprime les accents — utilisé par la détection thématique.
+ * Filtre les diacritiques combinants (U+0300–U+036F) après décomposition NFD,
+ * sans littéral regex contenant des caractères combinants (illisible et fragile).
+ */
+export function stripAccents(input: string): string {
+  let out = "";
+  for (const ch of input.normalize("NFD")) {
+    const cp = ch.codePointAt(0)!;
+    if (cp < 0x0300 || cp > 0x036f) out += ch;
+  }
+  return out;
+}
+
+
+// ─── Sélection du corpus classifiable ───────────────────────────────────────
+
+/** Un titre mentionnant un texte législatif porte une information exploitable. */
+const RE_TEXTE_LEGISLATIF =
+  /(projet de loi|proposition de loi|proposition de resolution|declaration du gouvernement)/;
+
+/**
+ * Votes de pure gestion de séance : prolongation, suspension, ordre du jour.
+ * Sans rapport avec un engagement électoral, même lorsqu'ils sont rattachés à un
+ * dossier législatif (ex. « la proposition du Gouvernement de prolonger la séance
+ * en cours au-delà de vingt heures »).
+ *
+ * Formulé étroitement à dessein : « réserve » seul attraperait la « réserve
+ * communale de sécurité civile », qui est un vrai texte de loi.
+ */
+const RE_GESTION_SEANCE =
+  /(prolonger la seance|prolongation de la seance|suspension de (la )?seance|lever la seance|fixation de l'ordre du jour)/;
+
+/** Catégorie éditoriale d'un scrutin. */
+export function computeCategorie(scrutin: ScrutinAN): CategorieScrutin {
+  const code = scrutin.typeVote?.codeTypeVote;
+  const titre = normalizeText(scrutin.titre ?? "");
+
+  if (code === "SPS") return "solennel";
+  if (code === "MOC") return "motion_censure";
+  if (titre.startsWith("l'ensemble")) return "ensemble_texte";
+  if (titre.includes("amendement")) return "amendement";
+  if (titre.includes("motion")) return "motion_procedure";
+  return "autre";
+}
+
+/**
+ * Le scrutin porte-t-il une information sémantique suffisante pour être classifié ?
+ *
+ * Mesuré sur la 17e législature : 1 212 scrutins éligibles sur 8 434 (14,4 %).
+ * Les 7 221 votes d'amendements sont exclus — leur libellé
+ * ("l'amendement n° 1762 de M. Le Coq à l'article 2 du projet de loi de finances")
+ * ne dit rien du contenu de l'amendement, qui n'est pas dans Scrutins.json.
+ * C'est la principale source de bruit du score : voir §1.2 de l'audit.
+ */
+export function isEligible(scrutin: ScrutinAN): boolean {
+  const code = scrutin.typeVote?.codeTypeVote;
+  const titre = normalizeText(scrutin.titre ?? "");
+  const titreSansAccents = stripAccents(titre);
+
+  // Votes solennels et motions de censure : toujours retenus.
+  if (code === "SPS" || code === "MOC") return true;
+
+  // Gestion de séance : aucun rapport avec un engagement électoral.
+  if (RE_GESTION_SEANCE.test(titreSansAccents)) return false;
+
+  // Vote final sur l'ensemble d'un texte : libellé toujours substantiel.
+  if (titre.startsWith("l'ensemble")) return true;
+
+  // Amendements et sous-amendements : jamais classifiables sans enrichissement.
+  if (titre.includes("amendement")) return false;
+
+  // Vote sur article : le titre nomme le texte parent, donc exploitable.
+  // On accepte soit un dossier législatif rattaché, soit une mention explicite
+  // d'un texte de loi (687 des 688 scrutins concernés en comportent une).
+  const dossierRef = scrutin.objet?.dossierLegislatif?.dossierRef;
+  return Boolean(dossierRef) || RE_TEXTE_LEGISLATIF.test(titreSansAccents);
+}
+
+/**
+ * Résout le groupe d'un député À LA DATE DU VOTE.
+ *
+ * Sans cela, un député ayant changé de groupe verrait tous ses votes passés
+ * réattribués à son nouveau groupe — exactement ce que le schéma documente
+ * comme protection anti-manipulation, et que l'ETL ne faisait pas.
+ * Repli sur le groupe actuel si l'historique ne couvre pas la date.
+ */
+export function resolveGroupeAtDate(
+  deputeId: number,
+  dateVote: string,
+  historiqueParDepute: Map<number, GroupeHistoriqueRow[]>,
+  groupeActuel: number,
+): number {
+  const lignes = historiqueParDepute.get(deputeId);
+  if (!lignes || lignes.length === 0) return groupeActuel;
+
+  for (const l of lignes) {
+    const commence = l.date_debut <= dateVote;
+    const finit = l.date_fin !== null && l.date_fin < dateVote;
+    if (commence && !finit) return l.groupe_id;
+  }
+  return groupeActuel;
+}
+
 // ─── Construction des lignes ────────────────────────────────────────────────
 
 /**
@@ -204,18 +394,29 @@ export async function sha256Hex(input: string): Promise<string> {
 export function buildScrutinRow(scrutin: ScrutinAN): ScrutinRow {
   const numero = toNumber(scrutin.numero, 0);
   const legislature = toNumber(scrutin.legislature, 17);
+  const dossier = scrutin.objet?.dossierLegislatif ?? null;
   return {
     uid_an: scrutin.uid,
     numero,
     legislature,
     titre: (scrutin.titre ?? scrutin.objet?.libelle ?? "Sans titre").substring(0, 500),
     objet: scrutin.objet?.libelle ?? scrutin.titre ?? "Sans objet",
-    expose_des_motifs: null, // Absent de Scrutins.json — enrichissement prévu au Sprint 2
+    // L'exposé des motifs n'est pas dans Scrutins.json : il faudrait joindre le
+    // jeu de données des dossiers législatifs via dossier_ref.
+    expose_des_motifs: null,
     date_scrutin: scrutin.dateScrutin,
     sort_adopte: isAdopte(scrutin),
     url_an: `https://www.assemblee-nationale.fr/dyn/${legislature}/scrutins/${numero}`,
     llm_traite: false,
     pertinent: null, // NULL = pas encore filtré (sémantique documentée du schéma)
+    // ── Sprint 2 : métadonnées de sélection du corpus ──
+    type_vote: scrutin.typeVote?.codeTypeVote ?? null,
+    libelle_type_vote: scrutin.typeVote?.libelleTypeVote ?? null,
+    categorie: computeCategorie(scrutin),
+    dossier_ref: dossier?.dossierRef ?? null,
+    dossier_libelle: dossier?.libelle ?? null,
+    demandeur: scrutin.demandeur?.texte ?? null,
+    eligible: isEligible(scrutin),
   };
 }
 
@@ -245,50 +446,100 @@ export function buildScrutinText(scrutin: ScrutinAN): string {
 }
 
 /**
+ * Extrait les mises au point d'un scrutin : rectifications de position déclarées
+ * par les députés après le vote.
+ *
+ * Une mise au point ne change PAS le résultat officiel du scrutin — elle rectifie
+ * la position individuelle consignée. Les ignorer exposerait le projet à des
+ * démentis publics documentés ; on les stocke donc à part de `position_vote`,
+ * dans `position_vote_corrigee`, pour que les deux restent inspectables.
+ *
+ * Renvoie une Map acteurRef → position rectifiée.
+ */
+export function extractMisesAuPoint(scrutin: ScrutinAN): Map<string, 1 | -1 | 0> {
+  const corrections = new Map<string, 1 | -1 | 0>();
+  const mp = scrutin.miseAuPoint;
+  if (!mp) return corrections;
+
+  const collecte = (
+    entries: MiseAuPointEntry[] | MiseAuPointEntry | null | undefined,
+    position: 1 | -1 | 0,
+  ): void => {
+    for (const entry of toArray(entries)) {
+      // Les éléments `null` sont des artefacts de la conversion XML→JSON.
+      if (!entry || !entry.votant) continue;
+      for (const votant of toArray(entry.votant)) {
+        if (votant?.acteurRef) corrections.set(votant.acteurRef, position);
+      }
+    }
+  };
+
+  collecte(mp.pours, 1);
+  collecte(mp.contres, -1);
+  collecte(mp.abstentions, 0);
+  // nonVotants / nonVotantsVolontaires rectifiés : le député déclare n'avoir pas
+  // voulu voter. Ce n'est pas une position exprimée, donc pas de correction.
+  return corrections;
+}
+
+/**
  * Extrait les votes nominatifs d'un scrutin.
  *
  * ⚠️ Un député absent n'apparaît dans AUCUNE liste : il ne produit donc aucune
  *    ligne. L'absence n'est pas représentable ici — elle se déduit de
  *    `nombreMembresGroupe`. Voir §3.1 de l'audit.
  *
- * ⚠️ groupe_id_au_moment_du_vote reçoit le groupe ACTUEL du député.
- *    Résolution via dim_depute_groupe_historique prévue au Sprint 2.
+ * `groupe_id_au_moment_du_vote` est résolu via dim_depute_groupe_historique à la
+ * date du scrutin : un député ayant changé de groupe ne voit pas ses votes passés
+ * réattribués à son nouveau groupe.
  */
 export function extractVoteRows(
   scrutin: ScrutinAN,
   scrutinDbId: number,
   deputeByUidAN: Map<string, DeputeRef>,
+  historiqueParDepute: Map<number, GroupeHistoriqueRow[]> = new Map(),
 ): VoteRow[] {
   const rows: VoteRow[] = [];
   const groupes = toArray(scrutin.ventilationVotes?.organe?.groupes?.groupe);
-
-  const acteurRefs = (entry: { votant: Votant | Votant[] } | null | undefined): string[] => {
-    if (!entry || !entry.votant) return [];
-    return toArray(entry.votant).map((v) => v.acteurRef).filter(Boolean);
-  };
+  const corrections = extractMisesAuPoint(scrutin);
 
   for (const groupe of groupes) {
     const nomi = groupe.vote?.decompteNominatif;
     if (!nomi) continue;
 
-    const push = (refs: string[], position: 1 | -1 | 0 | null): void => {
-      for (const ref of refs) {
-        const depute = deputeByUidAN.get(ref);
+    const push = (
+      entry: { votant: Votant | Votant[] } | null | undefined,
+      position: 1 | -1 | 0 | null,
+    ): void => {
+      if (!entry || !entry.votant) return;
+      for (const votant of toArray(entry.votant)) {
+        if (!votant?.acteurRef) continue;
+        const depute = deputeByUidAN.get(votant.acteurRef);
         if (!depute) continue;
+
+        const corrigee = corrections.get(votant.acteurRef);
         rows.push({
           scrutin_id: scrutinDbId,
           depute_id: depute.id,
-          groupe_id_au_moment_du_vote: depute.groupe_id,
+          groupe_id_au_moment_du_vote: resolveGroupeAtDate(
+            depute.id,
+            scrutin.dateScrutin,
+            historiqueParDepute,
+            depute.groupe_id,
+          ),
           position_vote: position,
+          par_delegation: votant.parDelegation === "true",
+          // Ne stocker la correction que si elle diffère réellement du vote consigné
+          position_vote_corrigee: corrigee !== undefined && corrigee !== position ? corrigee : null,
         });
       }
     };
 
-    push(acteurRefs(nomi.pours), 1);
-    push(acteurRefs(nomi.contres), -1);
-    push(acteurRefs(nomi.abstentions), 0);
-    push(acteurRefs(nomi.nonVotants), null);
-    push(acteurRefs(nomi.nonVotantsVolontaires), null);
+    push(nomi.pours, 1);
+    push(nomi.contres, -1);
+    push(nomi.abstentions, 0);
+    push(nomi.nonVotants, null);
+    push(nomi.nonVotantsVolontaires, null);
   }
   return rows;
 }
@@ -331,6 +582,152 @@ export function validateClassifications(
     result.retenus.push(c);
   }
   return result;
+}
+
+// ─── Contexte LLM reconstruit depuis la base ────────────────────────────────
+
+/**
+ * Variante de buildScrutinText() alimentée par une ligne de fact_scrutin.
+ *
+ * La phase de classification lit sa file d'attente en base et n'a donc plus
+ * besoin du ZIP de l'Open Data : tout le contexte utile est persisté par la
+ * phase d'ingestion.
+ */
+export function buildScrutinTextFromRow(row: ScrutinQueueRow): string {
+  const lignes = [
+    `SCRUTIN : ${row.uid_an} (n°${row.numero})`,
+    `DATE : ${row.date_scrutin}`,
+    `TYPE : ${row.libelle_type_vote ?? row.type_vote ?? "inconnu"}`,
+    `OBJET : ${row.objet}`,
+  ];
+  if (row.dossier_libelle) lignes.push(`DOSSIER LÉGISLATIF : ${row.dossier_libelle}`);
+  if (row.demandeur) lignes.push(`DEMANDÉ PAR : ${row.demandeur}`);
+  lignes.push(`RÉSULTAT : ${row.sort_adopte ? "adopté" : "rejeté"}`);
+  return lignes.join("\n");
+}
+
+// ─── Pré-filtrage thématique des promesses ──────────────────────────────────
+
+/**
+ * Mots-clés par thème (slugs de dim_theme), en minuscules SANS accent.
+ *
+ * Sert à réduire les ~1000 promesses candidates à quelques dizaines avant
+ * l'appel LLM. Demander à un modèle de retrouver les liens pertinents parmi un
+ * millier de candidats est le pire régime possible pour le rappel, et le terrain
+ * idéal pour les identifiants hallucinés.
+ *
+ * Volontairement lexical : transparent, auditable, sans coût et sans dépendance.
+ */
+export const THEME_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
+  "retraites": [
+    "retraite", "pension", "age de depart", "carriere longue", "penibilite",
+    "cotisation", "trimestre", "travail", "emploi", "chomage", "salarie", "syndicat",
+  ],
+  "fiscalite": [
+    "impot", "fiscal", "taxe", "tva", "budget", "finances", "prelevement",
+    "niche fiscale", "csg", "deficit", "dette", "credit d'impot", "douane", "recette",
+  ],
+  "immigration": [
+    "immigration", "immigre", "etranger", "asile", "aide medicale", "titre de sejour",
+    "naturalisation", "expulsion", "oqtf", "frontiere", "schengen", "nationalite", "migrant",
+  ],
+  "ecologie": [
+    "ecologie", "climat", "carbone", "energie", "nucleaire", "renouvelable", "eolien",
+    "pesticide", "biodiversite", "transition ecologique", "pollution", "environnement",
+    "eau", "dechet", "agriculture",
+  ],
+  "sante": [
+    "sante", "hopital", "medecin", "soin", "securite sociale", "desert medical",
+    "psychiatrie", "medicament", "soignant", "hospitalier", "handicap", "dependance",
+  ],
+  "securite": [
+    "securite", "police", "gendarmerie", "delinquance", "justice", "prison", "penal",
+    "narcotrafic", "violence", "terrorisme", "magistrat", "surete", "fraude", "crime",
+  ],
+  "education": [
+    "ecole", "education", "enseignant", "universite", "etudiant", "college", "lycee",
+    "apprentissage", "formation", "scolaire", "jeunesse", "enfant", "recherche",
+  ],
+  "pouvoir-achat": [
+    "pouvoir d'achat", "salaire", "smic", "prix", "inflation", "logement", "loyer",
+    "allocation", "rsa", "minima", "consommation", "banque", "credit", "commerce",
+  ],
+  "institutions": [
+    "constitution", "referendum", "election", "scrutin", "decentralisation",
+    "collectivite", "elu local", "commune", "senat", "proportionnelle", "democratie",
+    "municipal", "departement", "region", "outre-mer", "mayotte",
+  ],
+  "international": [
+    "europe", "europeen", "union europeenne", "otan", "ukraine", "defense", "armee",
+    "traite", "international", "cooperation", "mercosur", "etranger", "diplomatie",
+  ],
+};
+
+/**
+ * Détecte les thèmes plausibles d'un scrutin à partir de son libellé.
+ * Renvoie les slugs triés par nombre de mots-clés trouvés (le plus pertinent d'abord).
+ */
+export function detectThemes(scrutinText: string): string[] {
+  const texte = stripAccents(normalizeText(scrutinText));
+  const scores: { slug: string; score: number }[] = [];
+
+  for (const [slug, motsCles] of Object.entries(THEME_KEYWORDS)) {
+    let score = 0;
+    for (const mot of motsCles) {
+      if (texte.includes(mot)) score++;
+    }
+    if (score > 0) scores.push({ slug, score });
+  }
+  return scores.sort((a, b) => b.score - a.score).map((s) => s.slug);
+}
+
+export interface PrefiltrageResult {
+  candidates: Promesse[];
+  themesDetectes: string[];
+  repliToutesPromesses: boolean;
+}
+
+/**
+ * Sélectionne les promesses à soumettre au LLM pour un scrutin donné.
+ *
+ * Si aucun thème n'est détecté, on retombe sur l'ensemble des promesses :
+ * en matière de redevabilité, un lien manqué coûte plus cher que quelques
+ * milliers de tokens supplémentaires.
+ */
+export function selectCandidatePromesses(
+  scrutinText: string,
+  promesses: Promesse[],
+  themeSlugById: Map<number, string>,
+  maxCandidates: number,
+): PrefiltrageResult {
+  const themesDetectes = detectThemes(scrutinText);
+
+  if (themesDetectes.length === 0) {
+    return { candidates: promesses, themesDetectes, repliToutesPromesses: true };
+  }
+
+  // Les promesses sont ajoutées thème par thème, du plus pertinent au moins
+  // pertinent, jusqu'au plafond.
+  const rang = new Map(themesDetectes.map((slug, i) => [slug, i]));
+  const retenues = promesses
+    .filter((p) => {
+      const slug = themeSlugById.get(p.theme_id);
+      return slug !== undefined && rang.has(slug);
+    })
+    .sort((a, b) => {
+      const ra = rang.get(themeSlugById.get(a.theme_id)!) ?? Infinity;
+      const rb = rang.get(themeSlugById.get(b.theme_id)!) ?? Infinity;
+      return ra - rb || a.id - b.id;
+    });
+
+  if (retenues.length === 0) {
+    return { candidates: promesses, themesDetectes, repliToutesPromesses: true };
+  }
+  return {
+    candidates: retenues.slice(0, maxCandidates),
+    themesDetectes,
+    repliToutesPromesses: false,
+  };
 }
 
 /** Construit les lignes llm_classification à partir des classifications validées. */

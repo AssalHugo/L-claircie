@@ -34,12 +34,23 @@ import {
   buildClassificationRows,
   buildScrutinRow,
   buildScrutinText,
+  buildScrutinTextFromRow,
+  computeCategorie,
+  detectThemes,
+  extractMisesAuPoint,
   extractVoteRows,
   isAdopte,
+  isEligible,
+  normalizeText,
+  resolveGroupeAtDate,
+  selectCandidatePromesses,
   toNumber,
   validateClassifications,
+  type CategorieScrutin,
   type ClassificationBrute,
   type DeputeRef,
+  type GroupeHistoriqueRow,
+  type Promesse,
   type ScrutinAN,
   type ScrutinFile,
 } from "../supabase/functions/etl-nightly/lib.ts";
@@ -418,6 +429,252 @@ function verifierHelpers(): void {
   assert("isAdopte(repli \"n'a pas adopté\") → false", isAdopte(sansCode) === false, "ok");
 }
 
+// ─── Contrôle 7 : sélection du corpus (Sprint 2) ────────────────────────────
+
+function verifierEligibilite(scrutins: ScrutinAN[]): void {
+  console.log("\n── Contrôle 7 : sélection du corpus classifiable ──");
+
+  const parCategorie = new Map<CategorieScrutin, { total: number; eligibles: number }>();
+  let amendementsEligibles = 0;
+  let totalEligibles = 0;
+
+  for (const s of scrutins) {
+    const cat = computeCategorie(s);
+    const elig = isEligible(s);
+    const acc = parCategorie.get(cat) ?? { total: 0, eligibles: 0 };
+    acc.total++;
+    if (elig) { acc.eligibles++; totalEligibles++; }
+    parCategorie.set(cat, acc);
+    if (cat === "amendement" && elig) amendementsEligibles++;
+  }
+
+  console.log("     catégorie            total   éligibles");
+  for (const cat of [
+    "solennel", "motion_censure", "ensemble_texte", "motion_procedure", "autre", "amendement",
+  ] as CategorieScrutin[]) {
+    const acc = parCategorie.get(cat);
+    if (!acc) continue;
+    console.log(`     ${cat.padEnd(20)} ${String(acc.total).padStart(5)} ${String(acc.eligibles).padStart(11)}`);
+  }
+
+  const pct = ((totalEligibles / scrutins.length) * 100).toFixed(1);
+  assert(
+    "Aucun amendement déclaré éligible",
+    amendementsEligibles === 0,
+    `${amendementsEligibles} amendement(s) éligible(s)`,
+  );
+  assert(
+    "Tous les scrutins solennels sont éligibles",
+    parCategorie.get("solennel")?.total === parCategorie.get("solennel")?.eligibles,
+    `${parCategorie.get("solennel")?.eligibles}/${parCategorie.get("solennel")?.total}`,
+  );
+  assert(
+    "Toutes les motions de censure sont éligibles",
+    parCategorie.get("motion_censure")?.total === parCategorie.get("motion_censure")?.eligibles,
+    `${parCategorie.get("motion_censure")?.eligibles}/${parCategorie.get("motion_censure")?.total}`,
+  );
+  // Le corpus doit rester une minorité ciblée : si le filtre laissait passer la
+  // majorité des scrutins, il ne filtrerait plus rien.
+  assert(
+    "Corpus éligible entre 5 % et 25 % du total",
+    totalEligibles / scrutins.length >= 0.05 && totalEligibles / scrutins.length <= 0.25,
+    `${totalEligibles} scrutins éligibles (${pct} %)`,
+  );
+
+  // Régression : l'apostrophe typographique U+2019 faisait échapper des votes
+  // finaux au filtre "l'ensemble …".
+  const avecApostropheCourbe = scrutins.filter((s) => (s.titre ?? "").includes("’"));
+  const ensembleCourbe = avecApostropheCourbe.filter((s) =>
+    normalizeText(s.titre ?? "").startsWith("l'ensemble")
+  );
+  const ensembleCourbeEligibles = ensembleCourbe.filter(isEligible).length;
+  assert(
+    "Votes « l'ensemble » avec apostrophe U+2019 captés",
+    ensembleCourbe.length === ensembleCourbeEligibles,
+    `${ensembleCourbeEligibles}/${ensembleCourbe.length} captés ` +
+    `(${avecApostropheCourbe.length} titres contiennent U+2019)`,
+  );
+}
+
+// ─── Contrôle 8 : délégation et mises au point (Sprint 2) ───────────────────
+
+function verifierDelegationEtMisesAuPoint(scrutins: ScrutinAN[]): void {
+  console.log("\n── Contrôle 8 : délégation et mises au point ──");
+
+  const deputeByUidAN = new Map<string, DeputeRef>();
+  const asArray = <T>(v: T | T[] | null | undefined): T[] =>
+    !v ? [] : Array.isArray(v) ? v : [v];
+
+  for (const s of scrutins) {
+    for (const g of asArray(s.ventilationVotes?.organe?.groupes?.groupe)) {
+      const dn = g.vote?.decompteNominatif;
+      if (!dn) continue;
+      for (const cle of ["pours", "contres", "abstentions", "nonVotants", "nonVotantsVolontaires"] as const) {
+        for (const v of asArray(dn[cle]?.votant)) {
+          if (v.acteurRef && !deputeByUidAN.has(v.acteurRef)) {
+            deputeByUidAN.set(v.acteurRef, {
+              id: deputeByUidAN.size + 1, uid_an: v.acteurRef, groupe_id: 1,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  let delegations = 0;
+  let corrections = 0;
+  let scrutinsAvecCorrection = 0;
+  let correctionsHorsBornes = 0;
+
+  for (const s of scrutins) {
+    const mp = extractMisesAuPoint(s);
+    if (mp.size > 0) scrutinsAvecCorrection++;
+    for (const position of mp.values()) {
+      if (position !== 1 && position !== -1 && position !== 0) correctionsHorsBornes++;
+    }
+    for (const row of extractVoteRows(s, 1, deputeByUidAN)) {
+      if (row.par_delegation) delegations++;
+      if (row.position_vote_corrigee !== null) corrections++;
+    }
+  }
+
+  assert(
+    "Votes par délégation détectés",
+    delegations > 0,
+    `${delegations} votes par procuration (${((delegations / 1270476) * 100).toFixed(1)} % du corpus)`,
+  );
+  assert(
+    "Mises au point extraites",
+    scrutinsAvecCorrection > 0,
+    `${scrutinsAvecCorrection} scrutins concernés, ${corrections} votes rectifiés`,
+  );
+  assert("Positions rectifiées ∈ {1, -1, 0}", correctionsHorsBornes === 0, `${correctionsHorsBornes} hors bornes`);
+}
+
+// ─── Contrôle 9 : résolution du groupe à la date du vote (Sprint 2) ─────────
+
+function verifierResolutionGroupe(): void {
+  console.log("\n── Contrôle 9 : groupe du député à la date du vote ──");
+
+  // Député 1 : quitte le groupe 10 le 2025-03-01 pour le groupe 20.
+  const historique = new Map<number, GroupeHistoriqueRow[]>([
+    [1, [
+      { depute_id: 1, groupe_id: 10, date_debut: "2024-07-18", date_fin: "2025-02-28" },
+      { depute_id: 1, groupe_id: 20, date_debut: "2025-03-01", date_fin: null },
+    ]],
+  ]);
+
+  assert(
+    "Vote avant le changement → ancien groupe",
+    resolveGroupeAtDate(1, "2024-11-05", historique, 20) === 10,
+    "groupe 10",
+  );
+  assert(
+    "Vote après le changement → nouveau groupe",
+    resolveGroupeAtDate(1, "2025-06-10", historique, 20) === 20,
+    "groupe 20",
+  );
+  assert(
+    "Député sans historique → repli sur groupe actuel",
+    resolveGroupeAtDate(99, "2025-06-10", historique, 7) === 7,
+    "groupe 7",
+  );
+}
+
+// ─── Contrôle 10 : pré-filtrage thématique (Sprint 2) ───────────────────────
+
+function verifierPrefiltrage(scrutins: ScrutinAN[]): void {
+  console.log("\n── Contrôle 10 : pré-filtrage thématique des promesses ──");
+
+  const eligibles = scrutins.filter(isEligible);
+
+  // Jeu de promesses synthétique : 30 promesses par thème.
+  const themeSlugs = [
+    "retraites", "fiscalite", "immigration", "ecologie", "sante",
+    "securite", "education", "pouvoir-achat", "institutions", "international",
+  ];
+  const themeSlugById = new Map(themeSlugs.map((s, i) => [i + 1, s]));
+  const promesses: Promesse[] = [];
+  themeSlugs.forEach((_, i) => {
+    for (let k = 0; k < 30; k++) {
+      promesses.push({
+        id: promesses.length + 1,
+        intitule_court: `promesse ${k} thème ${i + 1}`,
+        source_citation: "citation",
+        groupe_id: 1,
+        theme_id: i + 1,
+      });
+    }
+  });
+
+  let avecTheme = 0;
+  let totalCandidates = 0;
+  let depassements = 0;
+  const MAX = 40;
+
+  for (const s of eligibles) {
+    const r = selectCandidatePromesses(buildScrutinText(s), promesses, themeSlugById, MAX);
+    if (!r.repliToutesPromesses) avecTheme++;
+    totalCandidates += r.candidates.length;
+    if (r.candidates.length > MAX && !r.repliToutesPromesses) depassements++;
+  }
+
+  const tauxDetection = ((avecTheme / eligibles.length) * 100).toFixed(1);
+  const moyCandidates = (totalCandidates / eligibles.length).toFixed(0);
+
+  assert("Plafond de candidates respecté", depassements === 0, `${depassements} dépassement(s)`);
+  assert(
+    "Au moins 80 % des scrutins éligibles obtiennent un thème",
+    avecTheme / eligibles.length >= 0.8,
+    `${tauxDetection} % (${avecTheme}/${eligibles.length}), ${moyCandidates} promesses envoyées en moyenne sur ${promesses.length}`,
+  );
+
+  // Contrôle de pertinence sur des cas non ambigus
+  const cas: { texte: string; attendu: string }[] = [
+    { texte: "l'ensemble du projet de loi de finances pour 2025", attendu: "fiscalite" },
+    { texte: "proposition de loi visant à sortir la France du piège du narcotrafic", attendu: "securite" },
+    { texte: "projet de loi relatif à l'accès au séjour des étrangers et à l'asile", attendu: "immigration" },
+  ];
+  const rates = cas.filter((c) => !detectThemes(c.texte).includes(c.attendu));
+  assert(
+    "Thèmes correctement détectés sur cas témoins",
+    rates.length === 0,
+    rates.length === 0 ? "3/3" : rates.map((c) => c.attendu).join(", "),
+  );
+}
+
+// ─── Contrôle 11 : contexte LLM reconstruit depuis la base ──────────────────
+
+function verifierContexteDepuisBase(scrutins: ScrutinAN[]): void {
+  console.log("\n── Contrôle 11 : contexte LLM reconstruit depuis fact_scrutin ──");
+
+  // La phase 2 de l'ETL ne relit plus le ZIP : elle reconstruit le contexte
+  // depuis les colonnes persistées. Les deux formes doivent porter la même info.
+  const exemple = scrutins.find((s) => isEligible(s) && s.objet?.dossierLegislatif?.libelle)
+    ?? scrutins.find(isEligible)!;
+  const row = buildScrutinRow(exemple);
+
+  const texte = buildScrutinTextFromRow({
+    id: 1,
+    uid_an: row.uid_an,
+    numero: row.numero,
+    titre: row.titre,
+    objet: row.objet,
+    date_scrutin: row.date_scrutin,
+    sort_adopte: row.sort_adopte,
+    type_vote: row.type_vote,
+    libelle_type_vote: row.libelle_type_vote,
+    categorie: row.categorie,
+    dossier_libelle: row.dossier_libelle,
+    demandeur: row.demandeur,
+  });
+
+  assert("Objet présent dans le contexte reconstruit", texte.includes(row.objet.substring(0, 40)), "ok");
+  assert("Résultat présent dans le contexte reconstruit", /RÉSULTAT : (adopté|rejeté)/.test(texte), "ok");
+  console.log("\n     Contexte reconstruit depuis la base :");
+  for (const ligne of texte.split("\n")) console.log(`       │ ${ligne.substring(0, 110)}`);
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -434,6 +691,12 @@ async function main(): Promise<void> {
   verifierTexteLlm(scrutins);
   verifierValidationLlm();
   verifierHelpers();
+  // ── Sprint 2 ──
+  verifierEligibilite(scrutins);
+  verifierDelegationEtMisesAuPoint(scrutins);
+  verifierResolutionGroupe();
+  verifierPrefiltrage(scrutins);
+  verifierContexteDepuisBase(scrutins);
 
   const echecs = checks.filter((c) => !c.ok);
   console.log("\n════════════════════════════════════════════════════════════════");

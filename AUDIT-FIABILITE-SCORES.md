@@ -338,13 +338,60 @@ Correctifs supplémentaires nécessaires pour que le point 5 fonctionne, ou trop
 
 Restent volontairement hors périmètre du Sprint 1, et toujours signalés par un commentaire dans le code : `groupe_id_au_moment_du_vote` (groupe actuel, à résoudre via l'historique — Sprint 2), la file d'attente persistante remplaçant `max_scrutins` (Sprint 2), et la migration de modèle (§8).
 
-### Sprint 2 — Fiabiliser l'entrée (2 à 3 jours)
+### Sprint 2 — Fiabiliser l'entrée ✅ **fait**
 
-6. Ajouter `type_vote`, `dossier_ref`, `demandeur`, `eligible` à `fact_scrutin`. Implémenter le filtre du §4.2 **avant** tout appel LLM.
-7. Trier les scrutins par date avant d'appliquer `max_scrutins`, et remplacer le plafond par une file d'attente persistante (`llm_traite = false`) pour ne rien perdre.
-8. Dédupliquer `dim_promesse` (table canonique + `promesse_groupe`).
-9. Persister `par_delegation`, appliquer les `miseAuPoint`, résoudre `groupe_id_au_moment_du_vote` via l'historique.
-10. Pré-filtrer les promesses candidates par thème avant l'appel Gemini.
+6. ✅ `type_vote`, `libelle_type_vote`, `categorie`, `dossier_ref`, `dossier_libelle`, `demandeur`, `eligible` ajoutés à `fact_scrutin`. Filtre du §4.2 appliqué **avant** tout appel LLM.
+7. ✅ File d'attente persistante : le plafond par run ne fait plus perdre de scrutins.
+8. ✅ `dim_promesse` dédupliquée (promesses canoniques + table `promesse_groupe`).
+9. ✅ `par_delegation` persisté, `miseAuPoint` appliquées, `groupe_id_au_moment_du_vote` résolu via l'historique.
+10. ✅ Pré-filtrage thématique lexical des promesses candidates avant l'appel Gemini.
+
+**Migration** : `supabase/migrations/20260725120000_sprint2_corpus_et_promesses.sql` (idempotente, rejouable).
+
+**ETL en deux phases découplées**, reliées par une file d'attente en base :
+
+| Phase | Rôle | Coût |
+|---|---|---|
+| 1 — Ingestion | ZIP AN → `fact_scrutin` (avec `eligible`) + `fact_vote_individuel` | Aucun appel LLM |
+| 2 — Classification | Lit `eligible = true AND llm_traite = false`, du plus ancien au plus récent | Gemini |
+
+Un scrutin ingéré mais non classifié reste dans la file jusqu'à traitement effectif, quel que soit le nombre de runs nécessaires. Le paramètre `LOOKBACK_DAYS` passe à `0` (aucune limite de date) : la file rend la fenêtre glissante inutile — et c'est elle qui provoquait la perte définitive de scrutins.
+
+**Corpus retenu — mesuré sur les 8 434 scrutins réels :**
+
+| Catégorie | Total | Éligibles |
+|---|---|---|
+| Solennel | 72 | **72** |
+| Motion de censure | 23 | **23** |
+| Vote final « l'ensemble … » | 157 | **157** |
+| Motion de procédure | 57 | **57** |
+| Autre (votes sur articles) | 904 | **889** |
+| **Amendement** | **7 221** | **0** |
+| **Total** | **8 434** | **1 198 (14,2 %)** |
+
+Deux corrections issues de la confrontation aux données réelles, absentes de la spécification initiale :
+
+- **Apostrophe typographique** : 541 titres utilisent U+2019 au lieu de l'apostrophe ASCII. Sans normalisation, 24 votes sur « l'ensemble » d'un texte échappaient au filtre. Une régression est désormais couverte par le contrôle 7.
+- **Votes de gestion de séance** : la règle du §4.2 laissait passer 14 votes de pure procédure (« prolonger la séance en cours au-delà de vingt heures ») car ils portent un `dossier_ref`. Exclusion ciblée ajoutée — formulée étroitement, car « réserve » seul attrapait la « réserve communale de sécurité civile », qui est un vrai texte de loi.
+
+**Vérification** — 45 contrôles, toujours hors ligne :
+
+```
+45/45 contrôles OK sur 8434 scrutins
+  ✅ Aucun amendement déclaré éligible               0
+  ✅ Corpus éligible entre 5 % et 25 %               1198 (14,2 %)
+  ✅ Votes « l'ensemble » avec apostrophe U+2019     24/24 captés
+  ✅ Votes par délégation détectés                   191 629 (15,1 %)
+  ✅ Mises au point extraites                        1 366 scrutins, 1 845 votes rectifiés
+  ✅ Groupe résolu à la date du vote                 avant / après changement
+  ✅ Pré-filtrage thématique                         36 promesses envoyées en moyenne au lieu de 300
+```
+
+**Réserve honnête sur le pré-filtrage** : le taux de détection thématique est de 100 % sur le corpus, ce qui mesure le *rappel* mais pas la *précision*. Les mots-clés n'ont pas encore été confrontés à de vraies promesses — seulement à un jeu synthétique. La qualité réelle du filtre ne sera établie que par le jeu de référence du Sprint 4. En cas de doute, le repli envoie toutes les promesses : un lien manqué coûte plus cher que quelques milliers de tokens.
+
+**Choix éditorial appliqué** : les mises au point ne remplacent pas le vote officiel. `position_vote` conserve le vote consigné, `position_vote_corrigee` porte la rectification. Le score utilisera `COALESCE(position_vote_corrigee, position_vote)`, et le Mode Expert pourra afficher les deux.
+
+Le Context Cache Gemini a été retiré : avec le pré-filtrage, chaque appel porte sur un jeu de promesses différent, le cache n'a plus d'objet. Cela supprime au passage le chemin de repli buggé signalé au §8.4.
 
 ### Sprint 3 — Le score (2 à 3 jours)
 

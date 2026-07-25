@@ -29,6 +29,12 @@ réel des scrutins et contrôle les invariants du schéma. À lancer après tout
 Options : `SCRUTINS_DIR=<dossier>` pour réutiliser une archive déjà décompressée,
 `SCRUTINS_LIMIT=<n>` pour une itération rapide.
 
+### Migrations de base de données
+```bash
+npx supabase db push          # Appliquer les migrations de supabase/migrations/
+npx supabase migration list   # Voir l'état des migrations
+```
+
 ### Supabase & Edge Functions
 ```bash
 # Tester l'Edge Function ETL en local

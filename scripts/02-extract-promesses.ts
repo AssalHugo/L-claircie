@@ -51,6 +51,8 @@ import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
 
+import { normalizeText } from "../supabase/functions/etl-nightly/lib.ts";
+
 dotenv.config({ path: ".env.local" });
 
 // ─── Validation env ────────────────────────────────────────────────────────
@@ -267,6 +269,8 @@ async function extractPromessesFromFile(
 }
 
 // ─── Hash de déduplication ──────────────────────────────────────────────────
+
+/** Hash historique, propre à un couple (groupe, citation). */
 function computeDedupeHash(groupeId: number, sourceCitation: string): string {
   return crypto
     .createHash("sha256")
@@ -274,20 +278,66 @@ function computeDedupeHash(groupeId: number, sourceCitation: string): string {
     .digest("hex");
 }
 
+/**
+ * Hash CANONIQUE : ne dépend que du texte de la citation, jamais du groupe.
+ *
+ * C'est lui qui permet de ne stocker qu'UNE promesse pour un programme commun.
+ * Auparavant, le programme du NFP était dupliqué en 4 lignes (LFI-NFP, SOC, ECOS,
+ * GDR) et celui d'Ensemble en 3 (EPR, HOR, DEM) : un texte identique recevait un id
+ * différent par groupe, était classifié N fois par le LLM, et pouvait donc obtenir
+ * des polarités divergentes — faisant diverger les scores de groupes signataires
+ * du même programme pour de pures raisons de bruit stochastique.
+ */
+function computeCanonicalHash(sourceCitation: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(normalizeText(sourceCitation).trim())
+    .digest("hex");
+}
+
 // ─── Insertion Supabase ─────────────────────────────────────────────────────
-async function insertPromesses(
+
+interface InsertionResult {
+  promessesInserees: number;
+  liaisonsCreees: number;
+}
+
+/**
+ * Insère les promesses sous forme CANONIQUE (une ligne par texte) puis crée les
+ * liaisons vers tous les groupes signataires dans promesse_groupe.
+ *
+ * `groupeIds` contient tous les groupes portant ces promesses : un seul pour un
+ * programme propre, plusieurs pour un programme de coalition.
+ */
+async function insertPromessesCanoniques(
   promesses: PromesseExtraite[],
-  groupeId: number,
+  groupeIds: number[],
   themeIdBySlug: Map<string, number>,
   sourcePdfNom: string,
   sourcePdfAnnee: number
-): Promise<number> {
-  if (promesses.length === 0) return 0;
+): Promise<InsertionResult> {
+  if (promesses.length === 0 || groupeIds.length === 0) {
+    return { promessesInserees: 0, liaisonsCreees: 0 };
+  }
 
-  const rows = promesses.map(p => {
+  // Le groupe "porteur" stocké sur la ligne canonique est le premier signataire.
+  // Le rattachement réel, lui, vit dans promesse_groupe.
+  const groupePorteur = groupeIds[0];
+  const typeEngagement = groupeIds.length > 1 ? "programme_coalition" : "programme_propre";
+
+  // Déduplication intra-lot : deux PDF d'une même coalition peuvent répéter la
+  // même citation, ce qui ferait échouer l'upsert sur dedupe_hash_canonique.
+  const parHash = new Map<string, PromesseExtraite>();
+  for (const p of promesses) {
+    const citation = p.source_citation.substring(0, 500);
+    const hash = computeCanonicalHash(citation);
+    if (!parHash.has(hash)) parHash.set(hash, p);
+  }
+
+  const rows = [...parHash.entries()].map(([hash, p]) => {
     const citation = p.source_citation.substring(0, 500);
     return {
-      groupe_id: groupeId,
+      groupe_id: groupePorteur,
       theme_id: themeIdBySlug.get(p.theme_slug)!,
       intitule_court: p.intitule_court.substring(0, 200),
       description_longue: p.description_longue ?? null,
@@ -295,23 +345,68 @@ async function insertPromesses(
       source_pdf_page: p.source_pdf_page,
       source_pdf_annee: sourcePdfAnnee,
       source_citation: citation,
-      dedupe_hash: computeDedupeHash(groupeId, citation),
+      dedupe_hash: computeDedupeHash(groupePorteur, citation),
+      dedupe_hash_canonique: hash,
+      est_canonique: true,
       statut: null,
     };
   });
 
   const BATCH = 50;
-  let inserted = 0;
+  let promessesInserees = 0;
+
+  // ignoreDuplicates: true — surtout NE PAS écraser une promesse déjà relue et
+  // corrigée par un administrateur lors d'une relance du script.
   for (let i = 0; i < rows.length; i += BATCH) {
     const { data, error } = await supabase
       .from("dim_promesse")
-      .upsert(rows.slice(i, i + BATCH), { onConflict: "dedupe_hash", ignoreDuplicates: true })
+      .upsert(rows.slice(i, i + BATCH), {
+        onConflict: "dedupe_hash_canonique",
+        ignoreDuplicates: true,
+      })
       .select("id");
 
-    if (error) { console.error("  ❌ Erreur upsert :", error.message); throw error; }
-    inserted += data?.length ?? 0;
+    if (error) { console.error("  ❌ Erreur upsert promesses :", error.message); throw error; }
+    promessesInserees += data?.length ?? 0;
   }
-  return inserted;
+
+  // Relecture des ids par hash : l'upsert en mode ignoreDuplicates ne renvoie
+  // que les lignes nouvellement créées, or il faut lier TOUTES les promesses.
+  const hashes = rows.map(r => r.dedupe_hash_canonique);
+  const idsParHash: number[] = [];
+  for (let i = 0; i < hashes.length; i += BATCH) {
+    const { data, error } = await supabase
+      .from("dim_promesse")
+      .select("id")
+      .in("dedupe_hash_canonique", hashes.slice(i, i + BATCH));
+    if (error) { console.error("  ❌ Erreur relecture promesses :", error.message); throw error; }
+    idsParHash.push(...(data ?? []).map((d: { id: number }) => d.id));
+  }
+
+  // Liaisons promesse ↔ groupes signataires
+  const liaisons = idsParHash.flatMap(promesseId =>
+    groupeIds.map(groupeId => ({
+      promesse_id: promesseId,
+      groupe_id: groupeId,
+      type_engagement: typeEngagement,
+      source_pdf_nom: sourcePdfNom,
+    }))
+  );
+
+  let liaisonsCreees = 0;
+  for (let i = 0; i < liaisons.length; i += BATCH) {
+    const { data, error } = await supabase
+      .from("promesse_groupe")
+      .upsert(liaisons.slice(i, i + BATCH), {
+        onConflict: "promesse_id,groupe_id",
+        ignoreDuplicates: true,
+      })
+      .select("id");
+    if (error) { console.error("  ❌ Erreur upsert liaisons :", error.message); throw error; }
+    liaisonsCreees += data?.length ?? 0;
+  }
+
+  return { promessesInserees, liaisonsCreees };
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -406,24 +501,36 @@ async function main(): Promise<void> {
       [...parTheme.entries()].sort((a, b) => b[1] - a[1])
         .forEach(([slug, nb]) => console.log(`    ${slug.padEnd(18)} : ${nb}`));
 
-      // ── Insertion pour CHAQUE groupe concerné ──
-      console.log(`\n  Insertion pour ${sigles.length} groupe(s)...`);
+      // ── Insertion CANONIQUE : une seule fois pour tous les groupes ──
+      // Auparavant une boucle insérait les mêmes promesses une fois par groupe,
+      // créant autant de doublons que de signataires.
+      console.log(`\n  Insertion canonique pour ${sigles.length} groupe(s)...`);
       const sourcePdfNom = config.pdfs.length === 1
         ? path.basename(config.pdfs[0])
         : `${config.description ?? "partage"}-${config.pdfs.length}-docs`;
 
+      const groupeIds: number[] = [];
       for (const sigle of sigles) {
         const groupe = groupeBySlug.get(sigle);
         if (!groupe) {
           console.warn(`  ⚠️  Groupe ${sigle} introuvable en BDD — ignoré`);
           continue;
         }
-        const inserted = await insertPromesses(
-          promessesExtraites, groupe.id, themeIdBySlug, sourcePdfNom, annee
+        groupeIds.push(groupe.id);
+      }
+
+      if (groupeIds.length > 0) {
+        const { promessesInserees, liaisonsCreees } = await insertPromessesCanoniques(
+          promessesExtraites, groupeIds, themeIdBySlug, sourcePdfNom, annee
         );
-        totalPromesses += inserted;
-        resultats.push({ groupe: sigle, source: `[partagé] ${sourcePdfNom}`, promesses: inserted });
-        console.log(`  ✅ ${sigle.padEnd(12)} : ${inserted} promesses insérées`);
+        totalPromesses += promessesInserees;
+        resultats.push({
+          groupe: sigles.join("+"),
+          source: `[coalition] ${sourcePdfNom}`,
+          promesses: promessesInserees,
+        });
+        console.log(`  ✅ ${promessesInserees} promesses canoniques insérées`);
+        console.log(`  🔗 ${liaisonsCreees} liaisons promesse↔groupe créées (type: programme_coalition)`);
       }
 
       await new Promise(r => setTimeout(r, 2000));
@@ -507,13 +614,14 @@ async function main(): Promise<void> {
 
     const annee = ANNEE_OVERRIDE ?? inferAnnee(fichiers[0]);
     const sourcePdfNom = fichiers.length === 1 ? fichiers[0] : `${sigle}-${fichiers.length}-docs`;
-    const inserted = await insertPromesses(
-      promessesGroupe, groupe.id, themeIdBySlug, sourcePdfNom, annee
+    const { promessesInserees, liaisonsCreees } = await insertPromessesCanoniques(
+      promessesGroupe, [groupe.id], themeIdBySlug, sourcePdfNom, annee
     );
 
-    totalPromesses += inserted;
-    resultats.push({ groupe: sigle, source: sourcePdfNom, promesses: inserted });
-    console.log(`\n  ✅ ${inserted} promesses insérées dans dim_promesse`);
+    totalPromesses += promessesInserees;
+    resultats.push({ groupe: sigle, source: sourcePdfNom, promesses: promessesInserees });
+    console.log(`\n  ✅ ${promessesInserees} promesses insérées dans dim_promesse`);
+    console.log(`  🔗 ${liaisonsCreees} liaisons promesse↔groupe créées (type: programme_propre)`);
   }
 
   // ── Résumé ──
