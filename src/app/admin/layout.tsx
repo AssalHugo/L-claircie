@@ -1,10 +1,17 @@
 import Link from "next/link";
+import { getAdminConnecte } from "@/lib/auth/admin";
+import { deconnecter } from "./login/actions";
 
-export default function AdminLayout({
+export default async function AdminLayout({
     children,
 }: {
     children: React.ReactNode;
 }) {
+    // Volontairement non bloquant : ce layout enveloppe aussi /admin/login, où
+    // l'utilisateur n'est par définition pas encore connecté. Le contrôle d'accès
+    // est porté par requireAdmin() dans chaque page et chaque Server Action.
+    const admin = await getAdminConnecte();
+
     return (
         <div className="min-h-screen bg-zinc-950 text-zinc-100">
             {/* Barre de navigation admin */}
@@ -18,29 +25,47 @@ export default function AdminLayout({
                             >
                                 ☀️ L&apos;Éclaircie — Admin
                             </Link>
-                            <nav className="flex gap-1">
-                                <Link
-                                    href="/admin/promesses"
-                                    className="px-3 py-2 rounded-md text-sm font-medium text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors"
-                                >
-                                    Promesses
-                                </Link>
-                                <Link
-                                    href="/admin/classifications"
-                                    className="px-3 py-2 rounded-md text-sm font-medium text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors cursor-not-allowed"
-                                    aria-disabled="true"
-                                >
-                                    Classifications
-                                </Link>
-                                <Link
-                                    href="/admin/scrutins"
-                                    className="px-3 py-2 rounded-md text-sm font-medium text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors cursor-not-allowed"
-                                    aria-disabled="true"
-                                >
-                                    Scrutins
-                                </Link>
-                            </nav>
+                            {admin && (
+                                <nav className="flex gap-1">
+                                    <Link
+                                        href="/admin/promesses"
+                                        className="px-3 py-2 rounded-md text-sm font-medium text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors"
+                                    >
+                                        Promesses
+                                    </Link>
+                                    <Link
+                                        href="/admin/classifications"
+                                        className="px-3 py-2 rounded-md text-sm font-medium text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors cursor-not-allowed"
+                                        aria-disabled="true"
+                                    >
+                                        Classifications
+                                    </Link>
+                                    <Link
+                                        href="/admin/scrutins"
+                                        className="px-3 py-2 rounded-md text-sm font-medium text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors cursor-not-allowed"
+                                        aria-disabled="true"
+                                    >
+                                        Scrutins
+                                    </Link>
+                                </nav>
+                            )}
                         </div>
+
+                        {admin && (
+                            <div className="flex items-center gap-3">
+                                <span className="hidden sm:inline text-sm text-zinc-400">
+                                    {admin.nom ?? admin.email}
+                                </span>
+                                <form action={deconnecter}>
+                                    <button
+                                        type="submit"
+                                        className="px-3 py-1.5 rounded-md text-sm font-medium text-zinc-300 border border-zinc-700 hover:bg-zinc-800 hover:text-white transition-colors"
+                                    >
+                                        Déconnexion
+                                    </button>
+                                </form>
+                            </div>
+                        )}
                     </div>
                 </div>
             </header>

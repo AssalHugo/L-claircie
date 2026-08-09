@@ -1,4 +1,8 @@
-export default function AdminPage() {
+import { requireAdmin } from "@/lib/auth/admin";
+
+export default async function AdminPage() {
+    await requireAdmin();
+
     return (
         <div className="space-y-6">
             <div>

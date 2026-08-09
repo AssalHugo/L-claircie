@@ -1,4 +1,5 @@
 import { createServerClient } from "@/lib/supabase/server";
+import { requireAdmin } from "@/lib/auth/admin";
 import { PromessesTable } from "./promesses-table";
 import type { Groupe, Theme, Promesse, PromesseGroupee } from "@/lib/types";
 
@@ -48,6 +49,10 @@ function grouperPromesses(promesses: Promesse[]): PromesseGroupee[] {
 }
 
 export default async function PromessesPage({ searchParams }: PageProps) {
+    // Avant toute lecture : la suite du composant utilise la clé de service,
+    // qui contourne la RLS.
+    await requireAdmin();
+
     const params = await searchParams;
     const supabase = createServerClient();
 
