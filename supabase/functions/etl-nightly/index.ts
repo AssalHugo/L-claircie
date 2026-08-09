@@ -269,6 +269,7 @@ Deno.serve(async (req: Request) => {
     fileAttenteRestante: 0,
     scrutinsClassifies: 0,
     classificationsInserees: 0,
+    scoresRecalcules: 0,
     erreurs: 0,
     coutLlmUsd: 0,
   };
@@ -592,6 +593,27 @@ Deno.serve(async (req: Request) => {
           );
         }
         stats.fileAttenteRestante = Math.max(0, stats.fileAttenteRestante - stats.scrutinsClassifies);
+      }
+    }
+
+    // ════════════════════════════════════════════════════════
+    // PHASE 3 — Recalcul des scores
+    //
+    // Le calcul vit en SQL (fonction refresh_scores) : n'importe qui ayant accès
+    // au schéma peut le relire et refaire le calcul. Argument de neutralité
+    // autant que choix technique — voir §4.5 de l'audit.
+    // ════════════════════════════════════════════════════════
+    if (!dryRun && (stats.classificationsInserees > 0 || phase === "classify")) {
+      console.log("[ETL] ── Phase 3 : recalcul des scores ──");
+      const { data: bilan, error: rErr } = await supabase.rpc("refresh_scores");
+      if (rErr) {
+        noteErreur(`refresh_scores: ${rErr.message}`);
+      } else {
+        const lignes = (bilan ?? []) as { niveau: string; lignes: number; publiables: number }[];
+        for (const l of lignes) {
+          console.log(`[ETL]   ${l.niveau} : ${l.lignes} scores, dont ${l.publiables} publiables`);
+        }
+        stats.scoresRecalcules = lignes.reduce((acc, l) => acc + Number(l.lignes), 0);
       }
     }
 
