@@ -548,6 +548,18 @@ Et au niveau de la base, via de vrais jetons JWT : l'administrateur voit sa lign
 
 Le test a révélé que **`civic_tech.sql` a divergé du schéma réellement utilisé** : il lui manque `dim_promesse.dedupe_hash` et `source_pdf_annee` (tous deux écrits par `02-extract-promesses.ts`), et `statut` y est `NOT NULL` alors que `02` y insère `NULL` et que `03` filtre précisément sur `NULL`. Un tiers reconstruisant la base depuis le dépôt n'obtenait donc pas le schéma de production — ce qui contredit frontalement l'objectif de vérifiabilité. Corrigé par `supabase/migrations/20260725100000_baseline_alignement_schema.sql`, entièrement conditionnelle (no-op sur la base de production).
 
+### Sprint 3 bis — Ingestion ciblée ✅ **fait**
+
+Les votes ne sont plus chargés que pour les scrutins **éligibles**. Mesuré sur le corpus réel : **198 844 lignes au lieu de 1 270 476, soit −84,3 %**, sans perdre la moindre donnée utile au score — les votes d'amendements n'entrent dans aucun calcul.
+
+Sur un plan gratuit limité à 500 Mo, la table des votes passait de 150-250 Mo à ~30 Mo. C'était la différence entre « ça tient tout juste » et « ça tient pour toute la législature ».
+
+Trois précautions :
+
+- **Les scrutins non éligibles restent insérés** dans `fact_scrutin`. Les écarter entièrement aurait cassé la déduplication : ils auraient été redétectés comme nouveaux à chaque run, et la boucle de backfill n'aurait jamais convergé. Ils documentent aussi le dénominateur réel — « 1 198 scrutins analysés sur 8 434 ».
+- **Colonne `votes_ingeres`** : rend la restriction réversible. Si la règle d'éligibilité s'élargit (enrichissement des amendements en V2), l'ETL retrouve seul les scrutins dont les votes manquent, sans ré-ingestion complète.
+- **Passe de réparation** en phase 1, qui tourne même lorsqu'aucun nouveau scrutin n'est détecté — c'est justement son cas d'usage principal.
+
 ### Sprint 4 — Prouver (1 à 2 jours)
 
 14. Constituer le gold standard (150-200 couples).

@@ -5,24 +5,26 @@ Chaque étape est vérifiable : ne passez à la suivante qu'après le contrôle 
 
 ---
 
-## ⚠️ À décider avant de commencer
+## 📦 Volume attendu
 
-**L'ETL ingère aujourd'hui les 8 434 scrutins de la législature et leurs 1,27 million
-de votes individuels.** Or seuls **1 198 scrutins sont éligibles** au calcul du score :
-les 7 221 votes d'amendements n'entrent dans aucun calcul.
+L'ETL n'ingère les votes que des scrutins **éligibles** au calcul du score. Mesuré
+sur la 17e législature :
 
-| Périmètre d'ingestion | Lignes `fact_vote_individuel` | Poids estimé avec index |
+| Périmètre | Lignes `fact_vote_individuel` | Poids estimé avec index |
 |---|---|---|
-| Tout (comportement actuel) | ~1 270 000 | **150 à 250 Mo** |
-| Scrutins éligibles seulement | ~180 000 | ~30 Mo |
+| Tout | 1 270 476 | 150 à 250 Mo |
+| **Éligibles seulement** (retenu) | **198 844** | **~30 Mo** |
 
-Le plan gratuit est limité à **500 Mo**. Le premier cas passe probablement, mais sans
-marge pour la suite de la législature. Le second est confortable et ne perd aucune
-donnée utile au score.
+Soit **84,3 % de volume évité**, sans perdre la moindre donnée utile au score : les
+7 221 votes d'amendements n'entrent dans aucun calcul, leur libellé ne permettant
+aucune classification fiable (§1.2 de l'audit).
 
-👉 **Recommandation : n'ingérer les votes que des scrutins éligibles.** C'est une
-modification d'une dizaine de lignes dans `etl-nightly/index.ts` — demandez-la avant
-de lancer le backfill, sinon vous devrez purger la table ensuite.
+Les scrutins non éligibles restent insérés dans `fact_scrutin` — ils pèsent quelques
+mégaoctets, servent de clé de déduplication et documentent le dénominateur réel.
+La colonne `votes_ingeres` rend la restriction réversible : si la règle d'éligibilité
+s'élargit un jour, l'ETL retrouve seul les scrutins dont les votes manquent.
+
+Le plan gratuit Supabase est limité à **500 Mo** : la marge est confortable.
 
 ---
 
@@ -96,6 +98,7 @@ Les six migrations s'appliquent dans l'ordre :
 | `20260725140000_sprint3` | calcul des scores, météo, intervalles |
 | `20260725160000_rls` | politiques d'accès |
 | `20260725180000_admin` | table d'autorisation de l'administration |
+| `20260725200000_ingestion_ciblee` | suivi des votes chargés (`votes_ingeres`) |
 
 **Contrôle** :
 
@@ -200,6 +203,22 @@ curl -X POST "$FN" -H "Authorization: Bearer $SR" -H "Content-Type: application/
 La réponse JSON indique `scrutinsDetectes` et `fileAttenteRestante` : c'est ce qui
 vous dit s'il reste du travail. Rien n'est perdu entre deux appels — la file d'attente
 vit en base.
+
+`scrutinsVotesIgnores` compte les scrutins insérés sans leurs votes (non éligibles),
+et `scrutinsRepares` les scrutins éligibles dont les votes manquaient et viennent
+d'être chargés.
+
+**Contrôle du volume** une fois l'ingestion terminée :
+
+```sql
+SELECT
+  count(*)                                          AS scrutins,
+  count(*) FILTER (WHERE eligible)                  AS eligibles,
+  count(*) FILTER (WHERE eligible AND NOT votes_ingeres) AS votes_manquants,
+  (SELECT count(*) FROM fact_vote_individuel)       AS votes
+FROM fact_scrutin;
+-- attendu en fin de backfill : ~8434 / ~1198 / 0 / ~198 800
+```
 
 > Une Edge Function du plan gratuit est limitée à **2 s de CPU** et 150 s d'horloge.
 > Si l'ingestion échoue par dépassement, réduisez `max_ingest` (100, puis 50).

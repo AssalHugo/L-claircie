@@ -265,6 +265,8 @@ Deno.serve(async (req: Request) => {
     scrutinsDetectes: 0,
     scrutinsInseres: 0,
     scrutinsEligibles: 0,
+    scrutinsVotesIgnores: 0,
+    scrutinsRepares: 0,
     votesInseres: 0,
     fileAttenteRestante: 0,
     scrutinsClassifies: 0,
@@ -355,7 +357,16 @@ Deno.serve(async (req: Request) => {
           : "")
       );
 
-      if (aIngerer.length > 0 && !dryRun) {
+      // Scrutins éligibles dont les votes manquent : run précédent interrompu, ou
+      // règle d'éligibilité élargie depuis. La réparation doit pouvoir tourner même
+      // quand il n'y a aucun nouveau scrutin à ingérer — c'est son cas principal.
+      const { count: nbAReparer } = await supabase
+        .from("fact_scrutin")
+        .select("*", { count: "exact", head: true })
+        .eq("eligible", true)
+        .eq("votes_ingeres", false);
+
+      if (!dryRun && (aIngerer.length > 0 || (nbAReparer ?? 0) > 0)) {
         // Référentiel des députés + historique des groupes
         const deputes = await fetchAllPaginated<DeputeRef>(
           (from, to) => supabase
@@ -385,6 +396,42 @@ Deno.serve(async (req: Request) => {
           `[ETL] ${deputeByUidAN.size} députés, ${historique.length} entrées d'historique de groupe`
         );
 
+        /**
+         * Charge les votes nominatifs d'un scrutin et le marque `votes_ingeres`.
+         * Renvoie false si au moins un lot a échoué — le scrutin reste alors dans
+         * la file de réparation pour un prochain run.
+         */
+        const ingererVotes = async (
+          scrutin: ScrutinAN,
+          scrutinDbId: number,
+        ): Promise<boolean> => {
+          const votesRows = extractVoteRows(scrutin, scrutinDbId, deputeByUidAN, historiqueParDepute);
+          let complet = true;
+
+          for (let i = 0; i < votesRows.length; i += 100) {
+            const lot = votesRows.slice(i, i + 100);
+            const { error: vErr } = await supabase.from("fact_vote_individuel").insert(lot);
+            if (vErr) {
+              noteErreur(`insert votes ${scrutin.uid}: ${vErr.message}`);
+              complet = false;
+            } else {
+              stats.votesInseres += lot.length;
+            }
+          }
+
+          if (!complet) return false;
+
+          const { error: mErr } = await supabase
+            .from("fact_scrutin")
+            .update({ votes_ingeres: true })
+            .eq("id", scrutinDbId);
+          if (mErr) {
+            noteErreur(`update votes_ingeres ${scrutin.uid}: ${mErr.message}`);
+            return false;
+          }
+          return true;
+        };
+
         for (const scrutin of aIngerer) {
           const row = buildScrutinRow(scrutin);
 
@@ -399,20 +446,49 @@ Deno.serve(async (req: Request) => {
             continue;
           }
           stats.scrutinsInseres++;
-          if (row.eligible) stats.scrutinsEligibles++;
 
-          const votesRows = extractVoteRows(scrutin, inserted.id, deputeByUidAN, historiqueParDepute);
-          for (let i = 0; i < votesRows.length; i += 100) {
-            const lot = votesRows.slice(i, i + 100);
-            const { error: vErr } = await supabase.from("fact_vote_individuel").insert(lot);
-            if (vErr) noteErreur(`insert votes ${scrutin.uid}: ${vErr.message}`);
-            else stats.votesInseres += lot.length;
+          // Les votes ne sont chargés que pour les scrutins éligibles : les votes
+          // d'amendements représentaient 85 % du volume sans entrer dans aucun
+          // calcul de score. Le scrutin lui-même reste inséré — il sert de clé de
+          // déduplication et documente le dénominateur réel.
+          if (!row.eligible) {
+            stats.scrutinsVotesIgnores++;
+            continue;
+          }
+          stats.scrutinsEligibles++;
+          await ingererVotes(scrutin, inserted.id);
+        }
+
+        // ── Réparation : scrutins devenus éligibles dont les votes manquent ──
+        // Se déclenche si la règle d'éligibilité s'élargit (enrichissement des
+        // amendements en V2) ou si un run précédent a échoué en cours de route.
+        const { data: aReparer } = await supabase
+          .from("fact_scrutin")
+          .select("id, uid_an")
+          .eq("eligible", true)
+          .eq("votes_ingeres", false)
+          .order("date_scrutin", { ascending: true })
+          .limit(maxIngest);
+
+        const filesAReparer = (aReparer ?? []) as { id: number; uid_an: string }[];
+        if (filesAReparer.length > 0) {
+          console.log(`[ETL] ${filesAReparer.length} scrutins éligibles sans votes — réparation`);
+          const parUid = new Map(filesAReparer.map((r) => [r.uid_an, r.id]));
+
+          for (const file of files) {
+            try {
+              const s = (JSON.parse(file.text) as ScrutinFile).scrutin;
+              const dbId = s?.uid ? parUid.get(s.uid) : undefined;
+              if (dbId === undefined) continue;
+              if (await ingererVotes(s, dbId)) stats.scrutinsRepares++;
+            } catch { /* JSON corrompu, ignoré */ }
           }
         }
 
         console.log(
-          `[ETL] Phase 1 terminée — ${stats.scrutinsInseres} scrutins ` +
-          `(dont ${stats.scrutinsEligibles} éligibles), ${stats.votesInseres} votes`
+          `[ETL] Phase 1 terminée — ${stats.scrutinsInseres} scrutins insérés ` +
+          `(${stats.scrutinsEligibles} éligibles, ${stats.scrutinsVotesIgnores} sans votes), ` +
+          `${stats.votesInseres} votes, ${stats.scrutinsRepares} réparés`
         );
       }
     }

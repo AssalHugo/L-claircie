@@ -481,6 +481,23 @@ function verifierEligibilite(scrutins: ScrutinAN[]): void {
     `${totalEligibles} scrutins éligibles (${pct} %)`,
   );
 
+  // Volume de votes économisé par l'ingestion ciblée : les votes ne sont chargés
+  // que pour les scrutins éligibles. Le plan gratuit Supabase plafonne à 500 Mo.
+  let votesTotal = 0;
+  let votesEligibles = 0;
+  for (const s of scrutins) {
+    const n = compterVotantsIndependamment(s);
+    votesTotal += n;
+    if (isEligible(s)) votesEligibles += n;
+  }
+  const economie = ((1 - votesEligibles / votesTotal) * 100).toFixed(1);
+  assert(
+    "Ingestion ciblée : plus de 70 % des votes évités",
+    votesEligibles / votesTotal < 0.3,
+    `${votesEligibles.toLocaleString("fr-FR")} lignes au lieu de ` +
+    `${votesTotal.toLocaleString("fr-FR")} (−${economie} %)`,
+  );
+
   // Régression : l'apostrophe typographique U+2019 faisait échapper des votes
   // finaux au filtre "l'ensemble …".
   const avecApostropheCourbe = scrutins.filter((s) => (s.titre ?? "").includes("’"));
