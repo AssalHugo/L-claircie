@@ -393,11 +393,160 @@ Deux corrections issues de la confrontation aux données réelles, absentes de l
 
 Le Context Cache Gemini a été retiré : avec le pré-filtrage, chaque appel porte sur un jeu de promesses différent, le cache n'a plus d'objet. Cela supprime au passage le chemin de repli buggé signalé au §8.4.
 
-### Sprint 3 — Le score (2 à 3 jours)
+### Sprint 3 — Le score ✅ **fait**
 
-11. Écrire `refresh_scores()` en PL/pgSQL selon le §4.3, avec `n_eff`, shrinkage, IC et seuil de publication.
-12. Ajouter la catégorie météo 🌫️ « Données insuffisantes ».
-13. Calculer et stocker les indicateurs **Présence** et **Couverture**, séparés de la cohérence.
+11. ✅ `refresh_scores()` en PL/pgSQL selon le §4.3 : `n_eff`, rétrécissement bayésien, intervalle de confiance, seuil de publication.
+12. ✅ Catégorie météo 🌫️ « Brouillard » (`label_meteo()`), affichée dès que `publiable = false`.
+13. ✅ **Présence** et **Couverture** calculées et stockées séparément de la cohérence.
+
+**Migration** : `supabase/migrations/20260725140000_sprint3_calcul_des_scores.sql`.
+
+Le calcul vit en SQL et non en TypeScript : quiconque a accès au schéma peut le relire et refaire le calcul. C'est un argument de neutralité autant qu'un choix technique. L'ETL l'appelle en phase 3 via `supabase.rpc("refresh_scores")`.
+
+Les paramètres éditoriaux sont **exposés en arguments de la fonction** (`p_poids_abstention`, `p_k_shrinkage`, `p_seuil_depute`…), ce qui rend l'analyse de sensibilité du §5.5 exécutable en une requête.
+
+#### Deux écarts assumés avec la spécification
+
+**1. Intervalle de Wilson au lieu d'un bootstrap.** Le §4.3 prévoyait un bootstrap. Le premier jet utilisait l'erreur-type de la moyenne pondérée — et le test l'a démenti : un député dont les 12 votes sont tous alignés a une variance d'échantillon **nulle**, donc un IC de largeur zéro. C'est exactement la surconfiance que l'intervalle devait empêcher.
+
+Le score étant un taux d'alignement (`p = (score_brut + 1)/2`, soit `score_0_100/100`), l'intervalle de Wilson est la méthode standard, correcte aux bornes, déterministe et calculable en SQL pur :
+
+| Député | n_eff | Score | IC — erreur-type | IC — Wilson |
+|---|---|---|---|---|
+| d9001 (12 votes identiques) | 12 | 82 | **[75, 75]** ❌ | **[61, 93]** ✅ |
+| d9005 (1 vote) | 1 | 55 | [55, 55] ❌ | [26, 81] ✅ |
+| d9004 (12 votes partagés) | 12 | 52 | [25, 81] | [32, 72] |
+
+**2. `refresh_scores()` rendue ré-entrante.** `CREATE TEMP TABLE … ON COMMIT DROP` ne libère les tables qu'au commit : deux appels dans une même transaction échouaient — précisément ce que fait l'analyse de sensibilité. Bug trouvé par le test, corrigé par des `DROP TABLE IF EXISTS` explicites.
+
+#### Vérification exécutée
+
+Docker n'étant pas disponible sur ce poste, les migrations et les tests ont été exécutés sur **PostgreSQL 18 réel via PGlite** (Postgres compilé en WebAssembly, sans Docker). Le schéma complet + les trois migrations s'appliquent proprement, et `supabase/tests/test_refresh_scores.sql` passe intégralement.
+
+Le jeu d'essai est construit pour que chaque valeur attendue soit calculable à la main :
+
+| Cas | Vérifie | Attendu | Obtenu |
+|---|---|---|---|
+| d9001 — 12 votes alignés | cohérence maximale + rétrécissement | 100 → 82 | ✅ |
+| d9002 — 12 votes opposés | opposition totale | 0 → 22 | ✅ |
+| d9003 — 12 abstentions | abstention à demi-poids | n_eff = 6 → 🌫️ | ✅ |
+| d9005 — scrutin lié à 2 promesses opposées | agrégation intra-scrutin | n_eff = 1, pas 2 | ✅ |
+| d9006 — scrutin solennel | pondération ×3 | n_eff = 3 | ✅ |
+| d9007 — motion de censure | exclue du score | aucune ligne | ✅ |
+| d9008 — vote rectifié | mise au point appliquée | score 100 | ✅ |
+| d9009 — classification brouillon | ignorée | aucune ligne | ✅ |
+| d9010 — transfuge | évalué sur le groupe du moment du vote | 1 ligne | ✅ |
+| Couverture | promesses testées / totales | 2/3 | ✅ |
+| Météo | 8 bornes + brouillard | — | ✅ |
+
+#### Analyse de sensibilité — premier résultat
+
+Sur le jeu d'essai, en faisant varier les arbitrages du §7 :
+
+| Variante | Score groupe | Météo groupe | d9001 | d9003 |
+|---|---|---|---|---|
+| Référence (abst. 0,5 / k=8) | 55 | nuage | soleil | 🌫️ |
+| Abstention ignorée (0) | 56 | nuage | soleil | *(exclu)* |
+| Abstention pleine (1) | 55 | nuage | soleil | **nuage** |
+| Rétrécissement faible (k=5) | 55 | nuage | soleil | 🌫️ |
+| Rétrécissement fort (k=15) | 55 | nuage | **éclaircies** | 🌫️ |
+
+La météo de **groupe** est stable sur toutes les variantes — c'est le résultat rassurant. En revanche deux basculements individuels apparaissent : d9003 sort du brouillard quand l'abstention pèse 1 (son `n_eff` passe de 6 à 12 et franchit le seuil), et d9001 perd son soleil avec un rétrécissement fort. **Les arbitrages éditoriaux ont donc un effet visible au niveau député.** Ce test devra être rejoué sur données réelles avant toute publication : si le classement des groupes bascule, le score est trop fragile pour être publié en l'état.
+
+#### Validation sur la vraie stack Supabase locale
+
+Rejouée ensuite sur **PostgreSQL 17.6** via `npx supabase start` + `db reset` (Docker). Trois défauts que PGlite ne pouvait pas révéler :
+
+**1. `supabase/migrations/` n'était pas autosuffisant.** `civic_tech.sql` vit à la racine du dépôt et n'est jamais joué par le CLI. Sur un projet Supabase **neuf**, `db push` aurait appliqué uniquement les migrations Sprint 2 et 3, et la première (`ALTER TABLE dim_promesse`) aurait échoué : la table n'existe pas. Corrigé par `00000000000000_init_schema.sql`, reprise idempotente de `civic_tech.sql` (16 clés étrangères nommées et gardées). Le dossier part désormais d'une base vide et supporte le rejeu complet.
+
+**2. `refresh_scores()` échouait via PostgREST.** Supabase active `pg_safeupdate` sur les connexions de l'API, qui rejette tout `DELETE` sans `WHERE`. L'ETL appelant la fonction par `supabase.rpc("refresh_scores")`, la phase 3 aurait échoué en production avec le code `21000` — alors qu'elle passait en SQL direct. Corrigé par `DELETE … WHERE true`.
+
+**3. Aucune politique RLS n'existait — la base était ouverte en écriture publique.** 🔴 *(corrigé)*
+
+Les 14 tables ont `rowsecurity = false`. Les tables créées par migration SQL n'ont pas RLS activé par défaut (contrairement à celles créées depuis le tableau de bord). Vérifié avec le rôle `anon`, celui de la clé publique embarquée dans le bundle navigateur :
+
+| Action tentée avec la seule clé publique | Résultat |
+|---|---|
+| Lire les classifications en `brouillon` | **autorisé** |
+| Passer une classification non validée en `publie` | **autorisé** |
+| Réécrire directement `cache_score_groupe` | **autorisé** |
+| `DELETE FROM fact_vote_individuel` | **autorisé** |
+| Appeler `refresh_scores()` | **autorisé** |
+
+C'était la négation du principe fondateur « l'IA propose, l'humain valide » : n'importe qui pouvait publier une classification que personne n'avait relue, ou réécrire les notes affichées. `AGENT.md` présentait pourtant la RLS comme centrale — elle n'avait simplement jamais été écrite.
+
+**Corrigé** par `20260725160000_rls_politiques_acces.sql`, sur une stratégie de refus par défaut : RLS activée sur les 14 tables, droits d'écriture révoqués pour `anon`/`authenticated` (seconde barrière si une politique trop permissive était ajoutée un jour), puis politiques `SELECT` explicites pour ce qui est réellement public.
+
+| Table | Accès public |
+|---|---|
+| `dim_groupe`, `dim_depute`, `dim_theme`, `dim_depute_groupe_historique` | lecture intégrale |
+| `fact_scrutin`, `fact_vote_individuel` | lecture intégrale (données ouvertes AN) |
+| `cache_score_groupe`, `cache_score_depute` | lecture intégrale, y compris `publiable = false` pour permettre l'affichage 🌫️ |
+| `dim_promesse`, `promesse_groupe` | **uniquement** `est_canonique` et `statut ∈ (auto, valide, active)` |
+| `llm_classification` | **uniquement** `statut_publication = 'publie'` |
+| `etl_run_log` | aucun accès (coûts d'API, traces d'erreur) |
+| `user_preferences`, `user_alertes` | propriétaire uniquement (`auth.uid()`) |
+| `v_alignement`, `refresh_scores()` | `service_role` uniquement |
+
+Deux pièges traités au passage : la vue `v_alignement` expose les classifications sans filtre de publication et s'exécutait avec les droits de son propriétaire (`security_invoker = true` + révocation) ; et `refresh_scores()` était appelable par `POST /rest/v1/rpc/refresh_scores` avec la seule clé publique.
+
+**Vérification** — `supabase/tests/test_rls.sql` rejoue chaque attaque avec le rôle `anon`. 20 contrôles, tous verts :
+
+```
+OK — anon ne voit AUCUN brouillon                     (0)
+OK — anon ne voit que les promesses validees          (1)
+OK — anon ne voit pas le journal ETL                  (0)
+OK — anon ne peut PAS publier une classification      (refuse)
+OK — anon ne peut PAS reecrire les scores             (refuse)
+OK — anon ne peut PAS supprimer les votes             (refuse)
+OK — anon ne peut PAS injecter/falsifier une promesse (refuse)
+OK — anon ne peut PAS declencher refresh_scores()     (refuse)
+OK — anon ne peut PAS lire la vue v_alignement        (refuse)
+OK — anon ne peut PAS vider une table                 (refuse)
+OK — service_role contourne RLS (ETL + admin intacts) (t)
+```
+
+Confirmé aussi au niveau HTTP : `POST /rest/v1/rpc/refresh_scores` renvoie **401** avec la clé publique et **200** avec la clé de service.
+
+#### La route `/admin` n'avait aucune authentification 🔴 *(corrigé)*
+
+La RLS ne pouvait pas fermer ce trou, et ne le pouvait pas par construction : `src/lib/supabase/server.ts` instancie le client avec `SUPABASE_SERVICE_ROLE_KEY`, qui possède `BYPASSRLS` — c'est précisément ce qui fait fonctionner l'administration. Or il n'existait **ni middleware, ni vérification de session** dans `src/app/admin/` : n'importe qui connaissant l'URL pouvait valider ou retirer des promesses en production.
+
+**Corrigé** par `20260725180000_admin_authentification.sql` + une couche applicative Next.js.
+
+*Source d'autorisation* : table `admin_utilisateur`, plutôt qu'une variable d'environnement — la liste est auditable, modifiable sans redéploiement, et la vérification passe par la RLS, donc démontrable par un test. Une politique ne laisse voir à un utilisateur que sa propre ligne active ; personne ne peut lire la liste complète ni s'y ajouter.
+
+*Trois barrières indépendantes*, parce qu'aucune ne suffit seule :
+
+| Barrière | Rôle | Limite |
+|---|---|---|
+| `src/middleware.ts` | redirige un visiteur non authentifié | Ne protège pas les Server Actions, et un middleware Next a déjà été contourné (CVE-2025-29927) |
+| `requireAdmin()` dans chaque page | bloque le rendu | — |
+| `requireAdmin()` dans **chaque Server Action** | **le vrai contrôle** | — |
+
+Ce dernier point est l'essentiel : une Server Action est un point d'entrée HTTP à part entière, appelable sans passer par l'interface. Les trois actions de `promesses/actions.ts` écrivent avec la clé de service : sans vérification propre, le middleware ne les couvrait pas.
+
+Deux détails qui comptent : `getUser()` est utilisé partout plutôt que `getSession()` — cette dernière lit le cookie sans le valider auprès de Supabase, donc un cookie forgé passerait ; et le paramètre `?suite=` est restreint aux chemins internes commençant par `/admin`, pour éviter une redirection ouverte.
+
+**Vérification de bout en bout**, sur la stack locale avec deux comptes réels :
+
+| Scénario | Résultat |
+|---|---|
+| Visiteur non authentifié → `/admin`, `/admin/promesses` | 307 vers `/admin/login?suite=…` |
+| Compte Supabase valide **mais absent** de `admin_utilisateur` | refusé, session immédiatement refermée |
+| Le même, tentant ensuite `/admin/promesses` directement | renvoyé à la connexion |
+| Compte autorisé | accès accordé, redirigé vers la page demandée |
+| Déconnexion | retour à la page de connexion |
+
+Et au niveau de la base, via de vrais jetons JWT : l'administrateur voit sa ligne, un utilisateur authentifié quelconque voit `[]`, un visiteur anonyme reçoit `permission denied`. Un accès révoqué (`actif = false`) cesse immédiatement d'être visible.
+
+`supabase/tests/test_rls.sql` couvre désormais **24 contrôles**, dont l'autorisation d'administration.
+
+**Amorçage** — le premier administrateur ne peut pas se créer lui-même, sinon la porte resterait ouverte. Procédure manuelle documentée dans la migration : créer l'utilisateur depuis le tableau de bord Supabase (sans activer l'inscription publique), puis l'insérer dans `admin_utilisateur`.
+
+#### Écart de schéma corrigé au passage
+
+Le test a révélé que **`civic_tech.sql` a divergé du schéma réellement utilisé** : il lui manque `dim_promesse.dedupe_hash` et `source_pdf_annee` (tous deux écrits par `02-extract-promesses.ts`), et `statut` y est `NOT NULL` alors que `02` y insère `NULL` et que `03` filtre précisément sur `NULL`. Un tiers reconstruisant la base depuis le dépôt n'obtenait donc pas le schéma de production — ce qui contredit frontalement l'objectif de vérifiabilité. Corrigé par `supabase/migrations/20260725100000_baseline_alignement_schema.sql`, entièrement conditionnelle (no-op sur la base de production).
 
 ### Sprint 4 — Prouver (1 à 2 jours)
 

@@ -35,6 +35,20 @@ npx supabase db push          # Appliquer les migrations de supabase/migrations/
 npx supabase migration list   # Voir l'état des migrations
 ```
 
+### Tests SQL (scores et sécurité)
+```bash
+psql "$DATABASE_URL" -f supabase/tests/test_refresh_scores.sql
+psql "$DATABASE_URL" -f supabase/tests/test_rls.sql
+```
+
+`test_rls.sql` rejoue avec le rôle `anon` chacune des attaques possibles depuis la clé publique
+(publier un brouillon, réécrire un score, supprimer les votes). À relancer après toute
+modification des politiques RLS ou ajout de table.
+
+Le script tourne dans une transaction annulée : il n'écrit rien durablement. Il attend une base
+**sans données réelles** (les assertions de présence et de couverture comptent tous les scrutins).
+À lancer après toute modification de `refresh_scores()` ou de la formule de score.
+
 ### Supabase & Edge Functions
 ```bash
 # Tester l'Edge Function ETL en local
