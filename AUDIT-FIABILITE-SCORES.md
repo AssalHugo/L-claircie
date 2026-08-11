@@ -548,17 +548,30 @@ Et au niveau de la base, via de vrais jetons JWT : l'administrateur voit sa lign
 
 Le test a révélé que **`civic_tech.sql` a divergé du schéma réellement utilisé** : il lui manque `dim_promesse.dedupe_hash` et `source_pdf_annee` (tous deux écrits par `02-extract-promesses.ts`), et `statut` y est `NOT NULL` alors que `02` y insère `NULL` et que `03` filtre précisément sur `NULL`. Un tiers reconstruisant la base depuis le dépôt n'obtenait donc pas le schéma de production — ce qui contredit frontalement l'objectif de vérifiabilité. Corrigé par `supabase/migrations/20260725100000_baseline_alignement_schema.sql`, entièrement conditionnelle (no-op sur la base de production).
 
-### Sprint 3 bis — Ingestion ciblée ✅ **fait**
+### Sprint 3 bis — Périmètre d'ingestion des votes
 
-Les votes ne sont plus chargés que pour les scrutins **éligibles**. Mesuré sur le corpus réel : **198 844 lignes au lieu de 1 270 476, soit −84,3 %**, sans perdre la moindre donnée utile au score — les votes d'amendements n'entrent dans aucun calcul.
+**Décision : ingérer tous les votes nominatifs.** Le paramètre `{"votes":"eligibles"}` reste disponible pour une base contrainte, mais n'est pas le défaut.
 
-Sur un plan gratuit limité à 500 Mo, la table des votes passait de 150-250 Mo à ~30 Mo. C'était la différence entre « ça tient tout juste » et « ça tient pour toute la législature ».
+J'avais d'abord restreint l'ingestion aux scrutins éligibles, sur une estimation de 150-250 Mo qui menaçait le plafond de 500 Mo. **La mesure réelle a invalidé le raisonnement** :
 
-Trois précautions :
+| Table | Lignes | Table | Index | Total |
+|---|---|---|---|---|
+| `fact_vote_individuel` | 1 270 476 | 63 Mo | 79 Mo | **143 Mo** |
+| `fact_scrutin` | 8 434 | | | 6 Mo |
+| `llm_classification` | ~4 800 | | | 2 Mo |
+| **Total base** | | | | **≈ 156 Mo (31 %)** |
 
-- **Les scrutins non éligibles restent insérés** dans `fact_scrutin`. Les écarter entièrement aurait cassé la déduplication : ils auraient été redétectés comme nouveaux à chaque run, et la boucle de backfill n'aurait jamais convergé. Ils documentent aussi le dénominateur réel — « 1 198 scrutins analysés sur 8 434 ».
-- **Colonne `votes_ingeres`** : rend la restriction réversible. Si la règle d'éligibilité s'élargit (enrichissement des amendements en V2), l'ETL retrouve seul les scrutins dont les votes manquent, sans ré-ingestion complète.
-- **Passe de réparation** en phase 1, qui tourne même lorsqu'aucun nouveau scrutin n'est détecté — c'est justement son cas d'usage principal.
+Et surtout, la restriction avait un coût analytique que le gain ne justifiait pas. Les votes nominatifs ne servent pas qu'au score de cohérence : ils alimentent aussi les **statistiques comparatives** — loyauté d'un député envers son groupe, proximité entre groupes, cohésion ([Agreement Index](https://datan.fr/statistiques/aide)). Or les votes d'amendements sont précisément ceux où la discipline de groupe se relâche : les écarter n'aurait pas seulement réduit la précision de ces mesures, cela les aurait **biaisées en sous-estimant systématiquement les dissidences**.
+
+Le `.dbml` du projet anticipait d'ailleurs explicitement cet usage : *« détecter les "rebelles" (députés dont le score diverge fortement de leur groupe) […] potentiellement virale »*.
+
+Ce qui reste de l'itération :
+
+- **Colonne `votes_ingeres`** : permet de reprendre un backfill interrompu et de rattraper les votes manquants si le périmètre change, dans les deux sens, sans ré-ingestion.
+- **Passe de réparation** en phase 1, qui tourne même lorsqu'aucun nouveau scrutin n'est détecté.
+- **Levier identifié** si le volume devenait contraignant : la clé primaire `id` de `fact_vote_individuel` coûte 27 Mo d'index et fait doublon avec l'index unique naturel `(depute_id, scrutin_id)`.
+
+À noter : la restriction du **corpus de classification** aux 1 198 scrutins éligibles (§4.2) reste entière — c'est elle qui porte le gain de fiabilité, et elle est indépendante du stockage des votes.
 
 ### Sprint 4 — Prouver (1 à 2 jours)
 

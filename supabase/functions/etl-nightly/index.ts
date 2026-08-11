@@ -29,6 +29,16 @@
  *   { "max_ingest": 300 }      → scrutins ingérés au maximum sur ce run
  *   { "max_classify": 40 }     → scrutins classifiés au maximum sur ce run
  *   { "phase": "ingest" }      → n'exécuter qu'une phase ("ingest" | "classify")
+ *   { "votes": "eligibles" }   → n'ingérer que les votes des scrutins éligibles
+ *                                (défaut : "tous" — voir plus bas)
+ *
+ * PÉRIMÈTRE DES VOTES. Par défaut l'ETL ingère TOUS les votes nominatifs, pas
+ * seulement ceux des scrutins entrant dans le score de cohérence. Ils servent
+ * aussi aux statistiques comparatives — loyauté d'un député envers son groupe,
+ * proximité entre groupes, cohésion — et s'en tenir aux scrutins éligibles
+ * biaiserait ces mesures : les votes d'amendements sont justement ceux où la
+ * discipline de groupe se relâche. Coût mesuré : 143 Mo pour 1,27 M de votes,
+ * soit 31 % du plan gratuit une fois le reste de la base compté.
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -247,12 +257,22 @@ Deno.serve(async (req: Request) => {
   let maxIngest = 300;
   let maxClassify = 40;
   let phase: "ingest" | "classify" | "both" = "both";
+  // Périmètre des votes nominatifs ingérés.
+  //   "tous"      (défaut) — nécessaire aux statistiques comparatives : loyauté
+  //                d'un député envers son groupe, proximité entre groupes,
+  //                cohésion. Coût mesuré : 143 Mo pour 1,27 M de votes.
+  //   "eligibles" — seulement les scrutins entrant dans le score de cohérence
+  //                (~199 000 votes, ~30 Mo). À réserver aux bases contraintes :
+  //                cela biaise les statistiques comparatives, les votes
+  //                d'amendements étant ceux où la discipline se relâche le plus.
+  let modeVotes: "tous" | "eligibles" = "tous";
   try {
     const body = await req.json();
     dryRun = body?.dry_run === true;
     maxIngest = body?.max_ingest ?? 300;
     maxClassify = body?.max_classify ?? 40;
     if (body?.phase === "ingest" || body?.phase === "classify") phase = body.phase;
+    if (body?.votes === "eligibles" || body?.votes === "tous") modeVotes = body.votes;
   } catch { /* body vide, valeurs par défaut */ }
 
   const supabase = createClient(
@@ -301,7 +321,7 @@ Deno.serve(async (req: Request) => {
 
   try {
     console.log(
-      `[ETL] Démarrage — dry_run=${dryRun}, phase=${phase}, ` +
+      `[ETL] Démarrage — dry_run=${dryRun}, phase=${phase}, votes=${modeVotes}, ` +
       `max_ingest=${maxIngest}, max_classify=${maxClassify}`
     );
 
@@ -360,11 +380,14 @@ Deno.serve(async (req: Request) => {
       // Scrutins éligibles dont les votes manquent : run précédent interrompu, ou
       // règle d'éligibilité élargie depuis. La réparation doit pouvoir tourner même
       // quand il n'y a aucun nouveau scrutin à ingérer — c'est son cas principal.
-      const { count: nbAReparer } = await supabase
+      let requeteNbAReparer = supabase
         .from("fact_scrutin")
         .select("*", { count: "exact", head: true })
-        .eq("eligible", true)
         .eq("votes_ingeres", false);
+      if (modeVotes === "eligibles") {
+        requeteNbAReparer = requeteNbAReparer.eq("eligible", true);
+      }
+      const { count: nbAReparer } = await requeteNbAReparer;
 
       if (!dryRun && (aIngerer.length > 0 || (nbAReparer ?? 0) > 0)) {
         // Référentiel des députés + historique des groupes
@@ -446,27 +469,31 @@ Deno.serve(async (req: Request) => {
             continue;
           }
           stats.scrutinsInseres++;
+          if (row.eligible) stats.scrutinsEligibles++;
 
-          // Les votes ne sont chargés que pour les scrutins éligibles : les votes
-          // d'amendements représentaient 85 % du volume sans entrer dans aucun
-          // calcul de score. Le scrutin lui-même reste inséré — il sert de clé de
-          // déduplication et documente le dénominateur réel.
-          if (!row.eligible) {
+          // Par défaut on charge TOUS les votes : ils servent aux statistiques
+          // comparatives (loyauté, proximité, cohésion), pas seulement au score
+          // de cohérence. Les restreindre biaiserait ces mesures, les votes
+          // d'amendements étant justement ceux où la discipline se relâche.
+          if (modeVotes === "eligibles" && !row.eligible) {
             stats.scrutinsVotesIgnores++;
             continue;
           }
-          stats.scrutinsEligibles++;
           await ingererVotes(scrutin, inserted.id);
         }
 
-        // ── Réparation : scrutins devenus éligibles dont les votes manquent ──
-        // Se déclenche si la règle d'éligibilité s'élargit (enrichissement des
-        // amendements en V2) ou si un run précédent a échoué en cours de route.
-        const { data: aReparer } = await supabase
+        // ── Réparation : scrutins dont les votes manquent ──
+        // Se déclenche si un run précédent a échoué en cours de route, ou si le
+        // périmètre a été élargi depuis (passage de `eligibles` à `tous`, ou
+        // règle d'éligibilité assouplie).
+        let requeteReparation = supabase
           .from("fact_scrutin")
           .select("id, uid_an")
-          .eq("eligible", true)
-          .eq("votes_ingeres", false)
+          .eq("votes_ingeres", false);
+        if (modeVotes === "eligibles") {
+          requeteReparation = requeteReparation.eq("eligible", true);
+        }
+        const { data: aReparer } = await requeteReparation
           .order("date_scrutin", { ascending: true })
           .limit(maxIngest);
 

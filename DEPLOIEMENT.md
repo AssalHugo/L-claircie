@@ -7,24 +7,34 @@ Chaque étape est vérifiable : ne passez à la suivante qu'après le contrôle 
 
 ## 📦 Volume attendu
 
-L'ETL n'ingère les votes que des scrutins **éligibles** au calcul du score. Mesuré
-sur la 17e législature :
+Tailles **mesurées** sur PostgreSQL 17.6, pas estimées :
 
-| Périmètre | Lignes `fact_vote_individuel` | Poids estimé avec index |
-|---|---|---|
-| Tout | 1 270 476 | 150 à 250 Mo |
-| **Éligibles seulement** (retenu) | **198 844** | **~30 Mo** |
+| Table | Lignes | Table | Index | Total |
+|---|---|---|---|---|
+| `fact_vote_individuel` | 1 270 476 | 63 Mo | 79 Mo | **143 Mo** |
+| `fact_scrutin` | 8 434 | | | 6 Mo |
+| `llm_classification` | ~4 800 | | | 2 Mo |
+| dimensions + caches | | | | ~5 Mo |
+| | | | | **≈ 156 Mo** |
 
-Soit **84,3 % de volume évité**, sans perdre la moindre donnée utile au score : les
-7 221 votes d'amendements n'entrent dans aucun calcul, leur libellé ne permettant
-aucune classification fiable (§1.2 de l'audit).
+Soit **31 % du plafond de 500 Mo** du plan gratuit. La marge est confortable pour
+toute la législature.
 
-Les scrutins non éligibles restent insérés dans `fact_scrutin` — ils pèsent quelques
-mégaoctets, servent de clé de déduplication et documentent le dénominateur réel.
-La colonne `votes_ingeres` rend la restriction réversible : si la règle d'éligibilité
-s'élargit un jour, l'ETL retrouve seul les scrutins dont les votes manquent.
+**L'ETL ingère tous les votes nominatifs par défaut**, et pas seulement ceux des
+1 198 scrutins éligibles au score. Ils servent aussi aux statistiques comparatives —
+loyauté d'un député envers son groupe, proximité entre groupes, cohésion. S'en tenir
+aux scrutins éligibles ne réduirait pas seulement la précision de ces mesures : cela
+les **biaiserait**, les votes d'amendements étant précisément ceux où la discipline
+de groupe se relâche.
 
-Le plan gratuit Supabase est limité à **500 Mo** : la marge est confortable.
+Si le volume devenait un problème, deux leviers dans cet ordre :
+
+1. la clé primaire `id` de `fact_vote_individuel` coûte **27 Mo** d'index et fait
+   doublon avec l'index unique naturel `(depute_id, scrutin_id)` ;
+2. le paramètre `{"votes":"eligibles"}` restreint l'ingestion aux scrutins éligibles
+   (~199 000 votes, ~30 Mo). La colonne `votes_ingeres` rend le choix réversible :
+   repasser en périmètre complet déclenche le rattrapage automatique des votes
+   manquants, sans ré-ingestion.
 
 ---
 
@@ -204,20 +214,20 @@ La réponse JSON indique `scrutinsDetectes` et `fileAttenteRestante` : c'est ce 
 vous dit s'il reste du travail. Rien n'est perdu entre deux appels — la file d'attente
 vit en base.
 
-`scrutinsVotesIgnores` compte les scrutins insérés sans leurs votes (non éligibles),
-et `scrutinsRepares` les scrutins éligibles dont les votes manquaient et viennent
-d'être chargés.
+`scrutinsRepares` compte les scrutins dont les votes manquaient et viennent d'être
+chargés — un run interrompu se rattrape donc tout seul au suivant.
 
 **Contrôle du volume** une fois l'ingestion terminée :
 
 ```sql
 SELECT
-  count(*)                                          AS scrutins,
-  count(*) FILTER (WHERE eligible)                  AS eligibles,
-  count(*) FILTER (WHERE eligible AND NOT votes_ingeres) AS votes_manquants,
-  (SELECT count(*) FROM fact_vote_individuel)       AS votes
+  count(*)                                     AS scrutins,
+  count(*) FILTER (WHERE eligible)             AS eligibles,
+  count(*) FILTER (WHERE NOT votes_ingeres)    AS votes_manquants,
+  (SELECT count(*) FROM fact_vote_individuel)  AS votes,
+  pg_size_pretty(pg_database_size(current_database())) AS taille_base
 FROM fact_scrutin;
--- attendu en fin de backfill : ~8434 / ~1198 / 0 / ~198 800
+-- attendu en fin de backfill : ~8434 / ~1198 / 0 / ~1 270 000
 ```
 
 > Une Edge Function du plan gratuit est limitée à **2 s de CPU** et 150 s d'horloge.
