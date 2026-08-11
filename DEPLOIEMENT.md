@@ -38,7 +38,141 @@ Si le volume devenait un problème, deux leviers dans cet ordre :
 
 ---
 
+## 💶 Ce que ça coûte
+
+Chiffrage bâti sur des mesures, pas des hypothèses : taille réelle des 6 programmes
+à extraire (43 928 tokens), 1 198 scrutins éligibles au backfill, et **64 scrutins
+éligibles par mois** en moyenne sur les 12 derniers mois d'activité parlementaire.
+
+Reste estimé : ~600 promesses extraites (~250 tokens de JSON chacune) et ~2 780 tokens
+d'entrée par classification (prompt + 40 promesses pré-filtrées + scrutin).
+
+### Peuplement initial — une seule fois
+
+| Étape | Économique | Recommandé |
+|---|---|---|
+| Extraction des promesses | 0,39 $ | 1,20 $ |
+| Relecture des promesses | 0,09 $ | 0,09 $ |
+| Classification des 1 198 scrutins | 1,19 $ | 8,39 $ |
+| **Total** | **1,67 $** (~1,55 €) | **9,68 $** (~8,90 €) |
+| *avec Batch API (−50 %)* | *0,84 $* | *4,84 $* |
+
+- **Économique** : tout en Flash-Lite, classification en passe simple.
+- **Recommandé** (§8.4 de l'audit) : extraction avec `gemini-3.6-flash` — c'est la
+  *ground truth*, une promesse mal extraite contamine tous les scores en aval — et
+  classification en **double passe** `3.6-flash` + `3.5-flash-lite`, l'accord entre
+  deux familles de modèles étant un bien meilleur signal de confiance que la
+  `confidence` auto-déclarée.
+
+**L'écart entre les deux scénarios est de 8 $, une seule fois.** À ce niveau, le
+critère de choix n'est pas le prix mais la justesse.
+
+> 💡 **Le palier gratuit Gemini peut absorber tout le backfill.** Il plafonne à
+> ~1 000–1 500 requêtes/jour et 15 requêtes/minute selon le modèle. Le backfill
+> demande 1 234 requêtes en passe simple, 2 432 en double passe : deux à trois jours
+> d'étalement, pour 0 €. Deux réserves — les prompts du palier gratuit **peuvent être
+> utilisés pour entraîner les modèles** (sans gravité ici, tout est déjà public), et
+> à 15 req/min il faut baisser `max_classify` à ~20 pour tenir dans les 150 s
+> d'une Edge Function.
+
+### Coût mensuel récurrent
+
+| Poste | Économique | Recommandé |
+|---|---|---|
+| Classification (~64 scrutins/mois) | 0,06 $ | 0,45 $ |
+| Supabase — plan Free | 0,00 $ | 0,00 $ |
+| Vercel — plan Hobby | 0,00 $ | 0,00 $ |
+| Nom de domaine | ~1,50 $ | ~1,50 $ |
+| **Total** | **~1,56 $/mois** (~1,45 €) | **~1,95 $/mois** (~1,80 €) |
+
+**Le nom de domaine coûte plus cher que l'intelligence artificielle.** Le budget
+< 5 €/mois est tenu avec une marge de 2,5×.
+
+### Marges par rapport aux plafonds gratuits
+
+| Ressource | Plafond | Usage projeté | Marge |
+|---|---|---|---|
+| Supabase — base de données | 500 Mo | ~156 Mo | 3,2× |
+| Supabase — egress | 5 Go/mois | quelques centaines de Mo | large |
+| Supabase — Edge Functions | 500 000/mois | ~30 | 16 000× |
+| Supabase — projets actifs | 2 | 1 | — |
+| Vercel — bande passante | 100 Go/mois | faible (ISR 24 h) | large |
+
+Trois points de vigilance, sans rapport avec le prix :
+
+- **Pause après 7 jours d'inactivité** sur le plan Free → battement `pg_cron` hebdomadaire (étape 8).
+- **2 s de CPU par Edge Function.** Le téléchargement et le parsing des 8 434 fichiers
+  du ZIP est l'opération la plus lourde du pipeline : si l'ingestion échoue, baisser
+  `max_ingest`.
+- **Vercel Hobby interdit l'usage commercial.** Un projet civique non lucratif est
+  dans les clous ; ouvrir des dons ferait techniquement basculer dans le plan Pro.
+
+### Vérifier les coûts réels
+
+L'ETL enregistre le coût de chaque run — inutile de rester sur des estimations :
+
+```sql
+SELECT date_trunc('month', created_at) AS mois,
+       sum(cout_llm_usd) AS cout_usd,
+       sum(nb_classes)   AS classifications
+FROM etl_run_log GROUP BY 1 ORDER BY 1 DESC;
+```
+
+---
+
+## 0. Vous avez déjà un projet Supabase ?
+
+**Ne le jetez pas sans avoir regardé ce qu'il contient.** L'ancien ETL était cassé —
+il n'insérait rien, y compris dans son propre journal d'erreurs. Les tables de faits
+sont donc probablement vides, mais les scripts `00` à `03`, eux, fonctionnaient :
+vos **promesses extraites et relues à la main** sont la partie coûteuse à refaire.
+
+Inspection préalable, dans **SQL Editor** :
+
+```sql
+SELECT 'dim_theme' AS t, count(*) FROM dim_theme
+UNION ALL SELECT 'dim_groupe',          count(*) FROM dim_groupe
+UNION ALL SELECT 'dim_depute',          count(*) FROM dim_depute
+UNION ALL SELECT 'dim_promesse',        count(*) FROM dim_promesse
+UNION ALL SELECT 'dim_promesse validées', count(*) FROM dim_promesse WHERE statut IN ('valide','auto')
+UNION ALL SELECT 'fact_scrutin',        count(*) FROM fact_scrutin
+UNION ALL SELECT 'fact_vote_individuel',count(*) FROM fact_vote_individuel
+UNION ALL SELECT 'llm_classification',  count(*) FROM llm_classification;
+```
+
+| Ce que vous voyez | Ce qu'il faut faire |
+|---|---|
+| `dim_promesse` peuplée, faits vides | **Garder le projet.** Sauvegarde, puis `db push` (étape 4). Les migrations sont idempotentes et conçues pour une base existante. Vous économisez l'extraction et surtout votre relecture. |
+| Tout est vide ou presque | Repartir propre : `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` puis `db push`. Inutile de créer un second projet — le plan Free n'en autorise que 2. |
+| Faits peuplés par l'ancien ETL | Purger les faits seulement : voir ci-dessous. |
+
+Sauvegarde avant toute opération (chaîne dans **Settings → Database**) :
+
+```bash
+pg_dump "$DATABASE_URL" -Fc -f sauvegarde-avant-migrations.dump
+```
+
+Purge des seules données de faits, en conservant promesses et référentiels :
+
+```sql
+BEGIN;
+TRUNCATE llm_classification, fact_vote_individuel, cache_score_groupe, cache_score_depute;
+DELETE FROM fact_scrutin;
+COMMIT;
+```
+
+> Les données produites par l'ancien pipeline sont à écarter quoi qu'il arrive :
+> `groupe_id_au_moment_du_vote` y contenait le groupe *actuel* du député et non celui
+> de la date du vote, et les scrutins n'avaient ni `eligible` ni `categorie`.
+
+Une fois l'inspection faite, passez directement à l'**étape 2** (les clés) : votre
+projet existe déjà.
+
+---
+
 ## 1. Créer le projet
+
+*(à sauter si vous conservez votre projet existant — voir étape 0)*
 
 1. [supabase.com/dashboard](https://supabase.com/dashboard) → **New project**
 2. Renseigner :
