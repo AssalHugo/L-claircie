@@ -146,20 +146,55 @@ UNION ALL SELECT 'llm_classification',  count(*) FROM llm_classification;
 | Tout est vide ou presque | Repartir propre : `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` puis `db push`. Inutile de créer un second projet — le plan Free n'en autorise que 2. |
 | Faits peuplés par l'ancien ETL | Purger les faits seulement : voir ci-dessous. |
 
-Sauvegarde avant toute opération (chaîne dans **Settings → Database**) :
+### Outillage : ni `psql` ni `pg_dump` à installer
+
+Le conteneur Docker de Supabase les embarque déjà (PostgreSQL 17.6, même version
+que le serveur distant). Deux précautions propres à cet environnement :
+
+- **Utiliser la chaîne « Session pooler »**, pas « Direct connection ».
+  `db.<ref>.supabase.co` ne résout qu'en IPv6, or les conteneurs Docker n'ont pas
+  d'IPv6 globale : la connexion directe échoue. Le pooler est en IPv4.
+  → **Settings → Database → Connection string → Session pooler**
+- **Préfixer par `MSYS_NO_PATHCONV=1`** sous Git Bash, sinon `/tmp/x.sql` est
+  converti en chemin Windows et `psql` ne trouve pas le fichier.
 
 ```bash
-pg_dump "$DATABASE_URL" -Fc -f sauvegarde-avant-migrations.dump
+# Le mot de passe reste dans une variable de shell, jamais dans un fichier versionné.
+export DBURL='postgresql://postgres.<ref>:<motdepasse>@aws-0-<region>.pooler.supabase.com:5432/postgres'
 ```
 
-Purge des seules données de faits, en conservant promesses et référentiels :
+### a. Sauvegarder
 
-```sql
-BEGIN;
-TRUNCATE llm_classification, fact_vote_individuel, cache_score_groupe, cache_score_depute;
-DELETE FROM fact_scrutin;
-COMMIT;
+```bash
+docker exec -e PGURL="$DBURL" supabase_db_civicTech \
+  sh -c 'pg_dump "$PGURL" -Fc -f /tmp/sauvegarde.dump'
+docker cp supabase_db_civicTech:/tmp/sauvegarde.dump ./sauvegarde-avant-migrations.dump
+ls -lh sauvegarde-avant-migrations.dump
 ```
+
+Restauration, si besoin : `pg_restore -d "$DBURL" --clean sauvegarde-avant-migrations.dump`
+
+### b. Inspecter
+
+```bash
+docker cp scripts/sql/01-inspecter-base-existante.sql supabase_db_civicTech:/tmp/inspect.sql
+MSYS_NO_PATHCONV=1 docker exec -e PGURL="$DBURL" supabase_db_civicTech \
+  sh -c 'psql "$PGURL" -f /tmp/inspect.sql'
+```
+
+Lire en priorité la **section 2** : si `numero`, `titre` ou `sort_adopte` sont
+`is_nullable = YES`, votre schéma diverge du schéma versionné — c'est ce qui a permis
+à l'ancien ETL d'insérer des scrutins incomplets.
+
+### c. Purger les faits
+
+```bash
+docker cp scripts/sql/02-purger-donnees-ancien-pipeline.sql supabase_db_civicTech:/tmp/purge.sql
+MSYS_NO_PATHCONV=1 docker exec -e PGURL="$DBURL" supabase_db_civicTech \
+  sh -c 'psql "$PGURL" -v ON_ERROR_STOP=1 -f /tmp/purge.sql'
+```
+
+Le script affiche les compteurs avant et après. `dim_promesse` doit rester intacte.
 
 > Les données produites par l'ancien pipeline sont à écarter quoi qu'il arrive :
 > `groupe_id_au_moment_du_vote` y contenait le groupe *actuel* du député et non celui
